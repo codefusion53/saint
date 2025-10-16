@@ -152,18 +152,22 @@ def optoai(
     torch.set_num_threads(1)  # Use 2 threads per worker for better CPU utilization
     
     # Initialize GPU in worker if requested (each worker gets its own CUDA context)
+    # WINDOWS FIX: Use cuda:0 for all workers to avoid device mismatch errors
+    # DataParallel will handle multi-GPU distribution within each worker
     if device == 'cuda':
         try:
             # Re-initialize CUDA in this worker process
             torch.cuda.init()
             # Verify GPU is accessible
             if torch.cuda.is_available():
-                # Use assigned GPU (supports multi-GPU)
+                # WINDOWS: Always use cuda:0 (default GPU)
+                # DataParallel in train_lstm_model will distribute across all GPUs
                 num_gpus = torch.cuda.device_count()
-                actual_gpu_id = gpu_id % num_gpus  # Wrap around if more workers than GPUs
-                torch.cuda.set_device(actual_gpu_id)
-                device = f'cuda:{actual_gpu_id}'
-                print(f"Day {k}: Using GPU {actual_gpu_id} (of {num_gpus} available)", flush=True)
+                torch.cuda.set_device(0)  # Always use GPU 0 as primary
+                device = 'cuda'  # Use 'cuda' instead of 'cuda:0' for compatibility
+                # Only print on first day to reduce output
+                if k % 50 == 0 or k == sst:
+                    print(f"Day {k}: Using GPU 0 as primary ({num_gpus} GPU(s) available via DataParallel)", flush=True)
             else:
                 # Fallback to CPU if GPU not available in worker
                 device = 'cpu'
@@ -559,7 +563,7 @@ def main():
             'snamet': 'D:/prodpy/5shash.csv',
             'sname1': 'D:/prodpy/5shash1.csv',
             'sname2': 'D:/prodpy/5shash2.csv',
-            'sname2r': 'D:/prod/5shash2.csv',  # Use existing MATLAB hash2 file with 730 rows
+            'sname2r': 'D:/ba/gc302x104hash2.csv',
             'r1': 654,
             'finf': 1,  # Target asset file index
         },
@@ -689,7 +693,7 @@ def main():
     else:
         ssfin = sfin
     
-    print(f"Training from day {sst} to day {ssfin} (will process to {ssfin+1})")
+    print(f"Training from day {sst} to day {ssfin}")
 
     # Initialize result matrices
     # MATLAB: hasht = zeros(height(t) + 1, length(hash2))
@@ -701,16 +705,16 @@ def main():
     # When len(t)=1002:
     #   - Create 1004 rows (indices 0-1003) for storage
     #   - Save first 1003 rows (indices 0-1002) matching MATLAB's 1003×730 output
-    hasht = np.zeros((len(t) + 2, len(hash2)), dtype=np.float64)
-    hash1 = np.zeros((len(t) + 2, len(hash2)), dtype=np.float64)
+    hasht = np.zeros((len(t) + 1, len(hash2)), dtype=np.float64)
+    hash1 = np.zeros((len(t) + 1, len(hash2)), dtype=np.float64)
 
     # Main training loop
     # MATLAB uses 1-based indexing: r=50 means row 50 (the 50th row)
     # Python uses 0-based indexing: r=49 means row 49 (the 50th row)
     # Since r2 is already 0-based after our validation, use it directly
-    r = r2  # Use hyperparameter row from asset config (already 0-based)
+    r = r2 - 1  # Use hyperparameter row from asset config
 
-    print(f"\nStarting training with hyperparameter set {r} (0-based index)...")
+    print(f"\nStarting training with hyperparameter set {r+1}...")
     print("="*70)
     
     # Parallel processing configuration
@@ -722,7 +726,7 @@ def main():
     # GPU worker configuration (only if device == 'cuda')
     # If you get out-of-memory errors, reduce this number:
     max_workers = 28
-    max_gpu_workers_override = None  # Set to integer (e.g., 2) to manually limit GPU workers
+    max_gpu_workers_override = 6  # Set to integer (e.g., 2) to manually limit GPU workers
     
     if use_parallel:
         # Parallel processing
@@ -746,13 +750,13 @@ def main():
                 # Each worker needs ~1-2GB, distribute across all GPUs
                 max_workers_per_gpu = 16  # NUCLEAR: 16 workers per GPU for absolute maximum speed
                 max_gpu_workers = num_gpus * max_workers_per_gpu
-                num_workers = min(cpu_count(), max_gpu_workers, 128)  # Cap at 128 total for max throughput
+                num_workers = min(cpu_count(), max_gpu_workers, 16)  # Cap at 128 total for max throughput
                 
                 print(f"\n{num_gpus} GPU(s) detected (Total memory: {total_gpu_memory:.1f} GB)")
-                print(f"Using {num_workers} parallel workers across {num_gpus} GPU(s)")
-                print(f"  ~{num_workers // num_gpus} workers per GPU")
+                print(f"Using {num_workers} parallel workers")
             
-            print(f"Note: Workers will be distributed across all {num_gpus} GPU(s)")
+            print(f"Note: All workers use GPU 0 as primary (Windows compatibility)")
+            print(f"      DataParallel distributes training across all {num_gpus} GPU(s) within each worker")
             print(f"      Set max_gpu_workers_override if you get OOM errors")
         else:
             # CPU parallel processing: can use more workers
@@ -773,15 +777,16 @@ def main():
         # Convert DataFrame to dict for pickling (Windows multiprocessing issue)
         t_len = len(t)
         
-        # Prepare arguments for each day, distributing across GPUs if available
+        # Prepare arguments for each day
         # MATLAB: for iday = sst:ssfin+1 where sst=670, ssfin=height(t)=len(t)
         # If len(t)=1000, MATLAB processes days 670 to 1001 (inclusive)
         # Python: range(sst, ssfin + 1 + 1) = range(670, 1002) gives 670-1001
         print(f"DEBUG: Creating args_list for range({sst}, {ssfin + 1 + 1}) = days {sst} to {ssfin+1}", flush=True)
         args_list = []
         for idx, iday in enumerate(range(sst, ssfin + 1 + 1)):
-            # Assign GPU in round-robin fashion across all available GPUs
-            gpu_id = idx % num_gpus if device == 'cuda' and num_gpus > 0 else 0
+            # WINDOWS FIX: Always use GPU 0 for all workers
+            # DataParallel will handle multi-GPU distribution within train_lstm_model
+            gpu_id = 0  # Always use primary GPU (cuda:0)
 
             args_list.append((
                 iday, fname, ain, dout, finf - 1, t_len, hash2, r, snfai, ssfin, sst, device, gpu_id
@@ -1043,7 +1048,7 @@ def main():
         print(f"Processing days {sst} to {ssfin} sequentially...")
         print(f"Total days to process: {ssfin - sst}")
         print(f"Device: {device}")
-        print(f"Hyperparameter row: r={r}")
+        print(f"Hyperparameter row: r={r+1}")
         print(f"Target asset (finf): {finf}")
         print()
         
@@ -1071,8 +1076,8 @@ def main():
     non_zero_count = np.count_nonzero(hasht)
     print(f"Debug: Total non-zero predictions: {non_zero_count}")
     print(f"Debug: Result matrix shape: {hasht.shape}")
-    print(f"Debug: Using hyperparameter column r={r}")
-    print(f"Debug: Non-zero in column {r}: {np.count_nonzero(hasht[:, r])}")
+    print(f"Debug: Using hyperparameter column r={r+1}")
+    print(f"Debug: Non-zero in column {r+1}: {np.count_nonzero(hasht[:, r])}")
 
     # IMPORTANT: Only save first len(t)+1 rows to match MATLAB output
     # MATLAB uses 1-based indexing so hasht has rows 1 to height(t)+1 = 1 to 1003

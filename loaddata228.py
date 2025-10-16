@@ -42,7 +42,7 @@ import pandas as pd
 def loaddata228(snfai, k, t, ifile):
     nMin = len(t)
     inputSize = 104
-    ain = np.zeros((nMin, 104), dtype=np.float64)
+    ain = np.zeros((nMin, 52), dtype=np.float64)
 
     # DEBUG: Check bounds for this day
     # if k > nMin - 50:  # Near the end of data
@@ -101,7 +101,7 @@ def loaddata228(snfai, k, t, ifile):
     # --- Build output vectors ---
     aout = np.zeros((nMin, 1), dtype=np.float64)
     # MATLAB creates output with same size as input
-    # Initialize with nMin elements (not nMin-1)
+    # Initialize with nMin elements
     cout = ["SHORT"] * nMin
 
     # MATLAB: for i=2:height(t)-1
@@ -120,14 +120,14 @@ def loaddata228(snfai, k, t, ifile):
     dout = pd.Categorical(cout).codes.astype(np.int64)
 
     # MATLAB: ain(k-580:k+1,j) where k is 1-based
-    # Python: ain[k-580:k+2] but must not exceed nMin
+    # Python: ain[k-580-1:k+1] but must not exceed nMin
     # Cap the upper bound to nMin to prevent index out of bounds
-    k_upper = min(k + 2, nMin)  # k+2 for inclusive end, but cap at nMin
+    k_upper = min(k + 1, nMin)  # k+2 for inclusive end, but cap at nMin
 
-    muX = np.mean(ain[k - 580:k_upper, 0:inputSize], axis=0, dtype=np.float64)
-    sigmaX = np.std(ain[k - 580:k_upper, 0:inputSize], axis=0, ddof=1, dtype=np.float64)
+    muX = np.mean(ain[k - 580 - 1:k_upper, 0:inputSize], axis=0, dtype=np.float64)
+    sigmaX = np.std(ain[k - 580 - 1:k_upper, 0:inputSize], axis=0, ddof=1, dtype=np.float64)
 
-    for i in range(k - 580, k_upper):
+    for i in range(k - 580 - 1, k_upper):
         for j in range(inputSize):
             ain[i, j] = (ain[i, j] - muX[j]) / sigmaX[j]
 
@@ -137,8 +137,9 @@ def loaddata228(snfai, k, t, ifile):
     anin = []
     ic = 520
     for i in range(27):
-        start_idx = k - ic - 19
-        end_idx = k - ic + 1
+        # MATLAB: tempi=ain1(k-ic-19:k-ic,:).'
+        start_idx = k - ic - 19 - 1
+        end_idx = k - ic
         # Ensure we don't go beyond array bounds
         if start_idx < 0 or end_idx > nMin:
             # If out of bounds, create a zero-filled sequence
@@ -151,15 +152,16 @@ def loaddata228(snfai, k, t, ifile):
         if temp.shape[0] != 20:
             print(f"ERROR: Training input {i} has wrong shape {temp.shape}, expected (20, 104). k={k}, ic={ic}, indices=[{start_idx}:{end_idx}]", flush=True)
 
-        anin.append(temp)                         # store in list
+        anin.append(temp)
         ic -= 20
 
     # --- Training output data (anout1) ---
     anout1 = []
     ic = 520
     for i in range(27):
-        start_idx = k - ic - 19
-        end_idx = k - ic + 1
+        # MATLAB: tempnin=dout(k-ic-19:k-ic).'; anout1(i,1)={tempnin};
+        start_idx = k - ic - 19 - 1
+        end_idx = k - ic
         # Ensure we don't go beyond array bounds
         if start_idx < 0 or end_idx > len(dout):
             # If out of bounds, create a zero-filled sequence
@@ -179,8 +181,9 @@ def loaddata228(snfai, k, t, ifile):
     avnin = []
     ic = 560
     for i in range(2):
-        start_idx = k - 19 - ic
-        end_idx = k - ic + 1
+        # MATLAB: tempvin=ain1(k-19-ic:k-ic,:).'
+        start_idx = k - 19 - ic - 1
+        end_idx = k - ic
         if start_idx < 0 or end_idx > nMin:
             temp = np.zeros((20, inputSize), dtype=np.float64)
             print(f"WARNING: Validation input {i} out of bounds (k={k}, ic={ic}, start={start_idx}, end={end_idx}, nMin={nMin})", flush=True)
@@ -197,8 +200,9 @@ def loaddata228(snfai, k, t, ifile):
     avnout1 = []
     ic = 560
     for i in range(2):
-        start_idx = k - 19 - ic
-        end_idx = k - ic + 1
+        # MATLAB: tempv=dout(k-19-ic:k-ic).'
+        start_idx = k - 19 - ic - 1
+        end_idx = k - ic
         if start_idx < 0 or end_idx > len(dout):
             temp = np.zeros(20, dtype=np.int64)
             print(f"WARNING: Validation output {i} out of bounds (k={k}, ic={ic}, start={start_idx}, end={end_idx}, len(dout)={len(dout)})", flush=True)
@@ -215,8 +219,9 @@ def loaddata228(snfai, k, t, ifile):
     pdata = []
     ic = 520
     for i in range(27):
-        start_idx = k - ic - 19 + 1
-        end_idx = k - ic + 1 + 1
+        # MATLAB: tempi=ain1(k-ic-19+1:k-ic+1,:).'
+        start_idx = k - ic - 19 + 1 - 1
+        end_idx = k - ic + 1
         if start_idx < 0 or end_idx > nMin:
             tempi = np.zeros((20, inputSize), dtype=np.float64)
             print(f"WARNING: Test input {i} out of bounds (k={k}, ic={ic}, start={start_idx}, end={end_idx}, nMin={nMin})", flush=True)

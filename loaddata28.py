@@ -47,7 +47,7 @@ def loaddata28(fname: str, ifile1a: int = 0) -> Tuple[np.ndarray, np.ndarray, pd
     """
     
     # Configuration
-    stf = 0      # Start file (first sheet index in Python is 0)
+    stf = 1      # Start file (first sheet index in Python is 0)
     finf = 26    # Final file (last sheet) - 26 different markets
     
     # Load Data from All Sheets
@@ -63,7 +63,7 @@ def loaddata28(fname: str, ifile1a: int = 0) -> Tuple[np.ndarray, np.ndarray, pd
     t = None
     first_sheet_rows = None
 
-    for ifile in range(stf, finf):
+    for ifile in range(stf - 1, finf):
         # Read each sheet
         df = pd.read_excel(fname, sheet_name=sheet_names[ifile])
 
@@ -116,7 +116,7 @@ def loaddata28(fname: str, ifile1a: int = 0) -> Tuple[np.ndarray, np.ndarray, pd
     for i in range(2, num_days):
         # MATLAB: range=(2:i) means indices 2 to i (1-based)
         # Python equivalent: range(1, i) means indices 1 to i-1 (0-based, matching MATLAB's 2:i)
-        range_slice = range(1, i)
+        range_slice = range(1, i + 1)
 
         # ====================================================================
         # Feature Set 1: Close Prices from 26 Different Markets (k1 = 0-25)
@@ -124,16 +124,16 @@ def loaddata28(fname: str, ifile1a: int = 0) -> Tuple[np.ndarray, np.ndarray, pd
         # Python: k1=0, so ain[i, 0], ain[i, 2], ain[i, 1] to match MATLAB exactly
         # ====================================================================
         k1 = 0
-        ain[i, k1] = snfai[i, 3, 0]    # MATLAB: ain(i,k1+1)=snfai(i,4,1)
-        ain[i, k1 + 2] = snfai[i, 3, 1]  # MATLAB: ain(i,k1+3)=snfai(i,4,2)
-        ain[i, k1 + 1] = snfai[i, 3, 2]  # MATLAB: ain(i,k1+2)=snfai(i,4,3)
-        ain[i, k1 + 3] = snfai[i, 3, 3] # Market 4
-        ain[i, k1 + 4] = snfai[i, 3, 4] # Market 5
-        ain[i, k1 + 5] = snfai[i, 3, 5] # Market 6
-        ain[i, k1 + 6] = snfai[i, 3, 6] # Market 7
-        ain[i, k1 + 7] = snfai[i, 3, 7] # Market 8
-        ain[i, k1 + 8] = snfai[i, 3, 8] # Market 9
-        ain[i, k1 + 9] = snfai[i, 3, 9] # Market 10 (GC - Gold)
+        ain[i, k1] = snfai[i, 3, 0]       # Market 1 (MATLAB: ain(i,k1+1)=snfai(i,4,1))
+        ain[i, k1 + 2] = snfai[i, 3, 1]   # Market 2
+        ain[i, k1 + 1] = snfai[i, 3, 2]   # Market 3
+        ain[i, k1 + 3] = snfai[i, 3, 3]   # Market 4
+        ain[i, k1 + 4] = snfai[i, 3, 4]   # Market 5
+        ain[i, k1 + 5] = snfai[i, 3, 5]   # Market 6
+        ain[i, k1 + 6] = snfai[i, 3, 6]   # Market 7
+        ain[i, k1 + 7] = snfai[i, 3, 7]   # Market 8
+        ain[i, k1 + 8] = snfai[i, 3, 8]   # Market 9
+        ain[i, k1 + 9] = snfai[i, 3, 9]   # Market 10 (GC - Gold)
         ain[i, k1 + 10] = snfai[i, 3, 10] # Market 11
         ain[i, k1 + 11] = snfai[i, 3, 11] # Market 12
         ain[i, k1 + 12] = snfai[i, 3, 12] # Market 13
@@ -165,7 +165,7 @@ def loaddata28(fname: str, ifile1a: int = 0) -> Tuple[np.ndarray, np.ndarray, pd
             # Slope = change in normalized price from day i-1 to day i
             min_price = np.min(snfai[range_slice, 3, ii])
             current_normalized = snfai[i, 3, ii] - min_price
-            previous_normalized = snfai[i-1, 3, ii] - min_price
+            previous_normalized = snfai[i - 1, 3, ii] - min_price
             ain[i, k1 + ii] = current_normalized - previous_normalized
 
     # ========================================================================
@@ -185,16 +185,16 @@ def loaddata28(fname: str, ifile1a: int = 0) -> Tuple[np.ndarray, np.ndarray, pd
     # Python equivalent: range(1, num_days-1) gives i=1 to num_days-2
     for i in range(1, num_days - 1):
         # MATLAB: aout(i+1,1)=snfai(i+1,4,ifile1a); % tomorrow's close price pit in i for training
-        aout[i+1, 0] = snfai[i+1, 3, ifile1a]  # Tomorrow's close price (field 4 in MATLAB = index 3 in Python)
+        aout[i + 1, 0] = snfai[i + 1, 3, ifile1a]  # Tomorrow's close price (field 4 in MATLAB = index 3 in Python)
 
         # MATLAB: aout(i,1)=snfai(i,4,ifile1a);  % today's close price
         aout[i, 0] = snfai[i, 3, ifile1a]  # Today's close price (field 4 in MATLAB = index 3 in Python)
 
         # MATLAB logic: if aout(i,1)>aout(i+1,1) then SHORT else LONG
         # Classification logic:
-        # SHORT: if today's close > tomorrow's close (price going down)
-        # LONG:  if today's close <= tomorrow's close (price going up)
-        if aout[i, 0] > aout[i+1, 0]:
+        # SHORT(0): if tomorrow's price < today's price (price going down)
+        # LONG(1):  if tomorrow's price >= today's price (price going up)
+        if aout[i, 0] > aout[i + 1, 0]:
             dout.append("SHORT")  # SHORT
         else:
             dout.append("LONG")  # LONG
