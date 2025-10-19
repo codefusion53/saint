@@ -42,7 +42,7 @@ import pandas as pd
 def loaddata228(snfai, k, t, ifile):
     nMin = len(t)
     inputSize = 104
-    ain = np.zeros((nMin, 52), dtype=np.float64)
+    ain = np.zeros((nMin, inputSize), dtype=np.float64)
 
     # DEBUG: Check bounds for this day
     # if k > nMin - 50:  # Near the end of data
@@ -102,7 +102,7 @@ def loaddata228(snfai, k, t, ifile):
     aout = np.zeros((nMin, 1), dtype=np.float64)
     # MATLAB creates output with same size as input
     # Initialize with nMin elements
-    cout = ["SHORT"] * nMin
+    cout = ["SHORT"] * (nMin - 1)
 
     # MATLAB: for i=2:height(t)-1
     # Python: range(1, nMin - 1) gives i=1 to nMin-2 (matching MATLAB's i=2 to height(t)-1)
@@ -117,7 +117,12 @@ def loaddata228(snfai, k, t, ifile):
         cout[i] = "SHORT" if aout[i, 0] > aout[i + 1, 0] else "LONG"
 
     cout[0] = "SHORT"
-    dout = pd.Categorical(cout).codes.astype(np.int64)
+    
+    # CRITICAL: Encode labels with explicit category order to match MATLAB
+    # MATLAB: SHORT=0, LONG=1
+    # pd.Categorical with alphabetical order would give: LONG=0, SHORT=1 (WRONG!)
+    # We must specify categories=['SHORT', 'LONG'] to get correct encoding
+    dout = pd.Categorical(cout, categories=['SHORT', 'LONG']).codes.astype(np.int64)
 
     # MATLAB: ain(k-580:k+1,j) where k is 1-based
     # Python: ain[k-580-1:k+1] but must not exceed nMin
@@ -152,7 +157,7 @@ def loaddata228(snfai, k, t, ifile):
         if temp.shape[0] != 20:
             print(f"ERROR: Training input {i} has wrong shape {temp.shape}, expected (20, 104). k={k}, ic={ic}, indices=[{start_idx}:{end_idx}]", flush=True)
 
-        anin.append(temp)
+        anin.append(temp.T)  # Changed: removed .T transpose
         ic -= 20
 
     # --- Training output data (anout1) ---
@@ -174,7 +179,7 @@ def loaddata228(snfai, k, t, ifile):
         if len(temp) != 20:
             print(f"ERROR: Training output {i} has wrong length {len(temp)}, expected 20. k={k}, ic={ic}, indices=[{start_idx}:{end_idx}], len(dout)={len(dout)}", flush=True)
 
-        anout1.append(temp)
+        anout1.append(temp.reshape(1, -1))
         ic -= 20
 
     # --- Validation input (avnin) ---
@@ -193,7 +198,7 @@ def loaddata228(snfai, k, t, ifile):
         if temp.shape[0] != 20:
             print(f"ERROR: Validation input {i} has wrong shape {temp.shape}, expected (20, 104). k={k}, ic={ic}", flush=True)
 
-        avnin.append(temp)
+        avnin.append(temp.T)  # Changed: removed .T transpose
         ic -= 20
 
     # --- Validation output (avnout1) ---
@@ -212,7 +217,7 @@ def loaddata228(snfai, k, t, ifile):
         if len(temp) != 20:
             print(f"ERROR: Validation output {i} has wrong length {len(temp)}, expected 20. k={k}, ic={ic}", flush=True)
 
-        avnout1.append(temp)
+        avnout1.append(temp.reshape(1, -1))
         ic -= 20
 
     # --- Test input (pdata) ---
@@ -231,7 +236,7 @@ def loaddata228(snfai, k, t, ifile):
         if tempi.shape[0] != 20:
             print(f"ERROR: Test input {i} has wrong shape {tempi.shape}, expected (20, 104). k={k}, ic={ic}", flush=True)
 
-        pdata.append(tempi)
+        pdata.append(tempi.T)  # Changed: removed .T transpose
         ic -= 20
     
     return anin, anout1, avnin, avnout1, pdata

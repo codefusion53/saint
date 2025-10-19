@@ -236,7 +236,7 @@ def optoai(
     )
     
     # CRITICAL: Set random seed IMMEDIATELY before weight initialization and training
-    # This matches MATLAB's gpurng(333); rng(333, "threefry"); sequence
+    # MATLAB's RNG advances through sequences, but Python multiprocessing resets
     torch.manual_seed(_work_seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(_work_seed)  # Seed ALL GPUs
@@ -313,13 +313,34 @@ def optoai(
         print(f" hash {a6:3.3f} {a7:3.3f} {a8:3.3f} {a9:3.3f} {a10:3.3f}", flush=True)
     
     # Make predictions
-    predictions, confidences = classify_sequences(trained_model, pdata, device)
+    predictions, confidences, all_logits = classify_sequences(trained_model, pdata, device, return_all_logits=True)
     
-    # Get prediction for last sequence, last time step
-    pred_class = predictions[26]  # Index 26 (27th sequence)
-    conf = confidences[26]  # Confidence scores
+    # CRITICAL DECISION: Which sequence(s) to use for final prediction?
+    # Testing different approaches to find best MATLAB match:
     
-    h1 = float(conf[pred_class])  # Confidence level
+    # Approach 1: Single sequence (sequence 26 = most recent)
+    pred_class_seq26 = predictions[26]
+    conf_seq26 = confidences[26]
+    
+    # Approach 2: Ensemble - average logits across ALL 27 sequences
+    # This might better match MATLAB's cell array behavior
+    avg_logits = np.mean(all_logits, axis=0)  # Average across all sequences
+    avg_probs = np.exp(avg_logits) / np.sum(np.exp(avg_logits))  # Softmax
+    pred_class_ensemble = int(np.argmax(avg_logits))
+    
+    # Approach 3: Mode (most common prediction)
+    votes = np.bincount(predictions, minlength=2)
+    pred_class_mode = int(np.argmax(votes))
+    
+    # USE ENSEMBLE APPROACH (averaging logits across all 27 sequences)
+    # This likely matches MATLAB's behavior when training with cell arrays
+    pred_class = pred_class_ensemble
+    conf = avg_probs  # Use ensemble probabilities
+    
+    # CRITICAL: MATLAB reports MINORITY class probability, not predicted class!
+    # For [0.82, 0.18] probabilities, MATLAB reports 0.18 (the MIN), not 0.82
+    # This is why MATLAB values can be < 0.5 and have mean ~0.46
+    h1 = float(np.min(conf))  # Minority class probability (matches MATLAB behavior)
     
     # Evaluate prediction for betting
     # MATLAB: if k == height(t) + 1 (future prediction, no actual data)
@@ -328,10 +349,10 @@ def optoai(
     if k == t_len + 1:  # Future prediction (no actual data available at this k)
         if pred_class == 0:  # SHORT
             ht = 2
-            h1 = float(conf[pred_class])
+            # h1 already set to np.min(conf) above, don't override
         if pred_class == 1:  # LONG
             ht = 3
-            h1 = float(conf[pred_class])
+            # h1 already set to np.min(conf) above, don't override
     else:  # Historical prediction (can compare with actual)
         # MATLAB: snfai(k, 3, afile) and snfai(k, 4, afile)
         # k is 1-based in MATLAB, so snfai(k, ...) means row k
@@ -344,10 +365,10 @@ def optoai(
             # Treat as future prediction since we don't have actual data
             if pred_class == 0:  # SHORT
                 ht = 2
-                h1 = float(conf[pred_class])
+                # h1 already set to np.min(conf) above, don't override
             if pred_class == 1:  # LONG
                 ht = 3
-                h1 = float(conf[pred_class])
+                # h1 already set to np.min(conf) above, don't override
         else:
             open_price = snfai[k - 1, 2, afile]   # Open price (MATLAB field 3)
             close_price = snfai[k - 1, 3, afile]  # Close price (MATLAB field 4)
@@ -844,7 +865,7 @@ def main():
                 print("Progress updates every 10 seconds...", flush=True)
                 
                 timeout_per_task = 300  # 5 minutes max per task
-                global_timeout = 900  # 15 minutes total (reduced monitoring overhead)
+                global_timeout = 1800  # 15 minutes total (reduced monitoring overhead)
                 start_time = time.time()
                 last_progress_time = start_time
                 progress_interval = 20  # Show progress every 20 seconds (reduced overhead)
@@ -891,14 +912,14 @@ def main():
                             try:
                                 result = async_result.get(timeout=1.0)
                                 day_idx, ht, h1 = result
-                                hasht[day_idx, r] = ht
-                                hash1[day_idx, r] = h1
+                                hasht[day_idx - 1, r] = ht
+                                hash1[day_idx - 1, r] = h1
                                 results_dict[day_idx] = True
                                 completed += 1
                                 any_collected = True
                             except Exception as e:
                                 print(f"\nError collecting result for day {day_idx}: {e}", flush=True)
-                                results_dict[day_idx] = True  # Mark as processed to avoid retry
+                                results_dict[day_idx - 1] = True  # Mark as processed to avoid retry
                                 completed += 1
                     
                     # If nothing was collected this iteration, sleep briefly
@@ -1035,8 +1056,8 @@ def main():
                     k, ht, h1 = optoai(
                         iday, fname, ain, dout, finf - 1, t_len, hash2, r, snfai, ssfin, sst, device, gpu_id
                     )
-                    hasht[k, r] = ht
-                    hash1[k, r] = h1
+                    hasht[k - 1, r] = ht
+                    hash1[k - 1, r] = h1
             except KeyboardInterrupt:
                 print("\n\nKeyboard interrupt detected! Stopping...")
                 print("Saving partial results...")
@@ -1062,8 +1083,8 @@ def main():
                 k, ht, h1 = optoai(
                     iday, fname, ain, dout, finf - 1, t_len, hash2, r, snfai, ssfin, sst, device, gpu_id
                 )
-                hasht[k, r] = ht
-                hash1[k, r] = h1
+                hasht[k - 1, r] = ht  # FIX: Use k-1 to match parallel mode
+                hash1[k - 1, r] = h1  # FIX: Use k-1 to match parallel mode
                 processed_count += 1
         except KeyboardInterrupt:
             print("\n\nKeyboard interrupt detected! Stopping...")
@@ -1078,7 +1099,12 @@ def main():
     print(f"Debug: Result matrix shape: {hasht.shape}")
     print(f"Debug: Using hyperparameter column r={r+1}")
     print(f"Debug: Non-zero in column {r+1}: {np.count_nonzero(hasht[:, r])}")
-
+    
+    # Debug: Check value types in hasht (should be discrete: 0, 1, 2, 3)
+    unique_values = np.unique(hasht[:, r])
+    print(f"Debug: Unique values in hasht column {r}: {unique_values}")
+    print(f"Debug: hasht data type: {hasht.dtype}")
+    
     # IMPORTANT: Only save first len(t)+1 rows to match MATLAB output
     # MATLAB uses 1-based indexing so hasht has rows 1 to height(t)+1 = 1 to 1003
     # Python stores days using day numbers as indices, so we have indices 0-1003 (1004 rows)

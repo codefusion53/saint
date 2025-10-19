@@ -72,9 +72,10 @@ def loaddata28(fname: str, ifile1a: int = 0) -> Tuple[np.ndarray, np.ndarray, pd
         # pandas also uses first row as headers by default, then we remove the first data row
         df = df.iloc[1:].reset_index(drop=True)
 
+        t = df.copy()
+        
         # Store first sheet for return
         if ifile == 0:
-            t = df.copy()
             first_sheet_rows = len(df)
             # Initialize 3D array based on first sheet's size (MATLAB behavior)
             snfai = np.zeros((first_sheet_rows, 19, len(sheet_names)), dtype=np.float64)
@@ -201,7 +202,12 @@ def loaddata28(fname: str, ifile1a: int = 0) -> Tuple[np.ndarray, np.ndarray, pd
 
     # MATLAB: cout(1,1)={'SHORT'}; - Initialize first element
     dout.insert(0, "SHORT")  # SHORT
-    dout = pd.Categorical(dout)
+    
+    # CRITICAL: Encode labels with explicit category order to match MATLAB
+    # MATLAB: SHORT=0, LONG=1
+    # pd.Categorical with alphabetical order would give: LONG=0, SHORT=1 (WRONG!)
+    # We must specify categories=['SHORT', 'LONG'] to get correct encoding
+    dout = pd.Categorical(dout, categories=['SHORT', 'LONG']).codes.astype(np.int64)
     
     return ain, dout, t, snfai
 

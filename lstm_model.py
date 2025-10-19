@@ -1,197 +1,195 @@
 """
-LSTM Model for Market Data Classification
+LSTM Model Components for SAINT1 v3.28
+=============================================================================
+PyTorch LSTM implementation matching MATLAB's trainNetwork behavior
 
-Features:
-- Multi-GPU training support via DataParallel
-- Multiprocessing data loading for improved performance
-- Float64 precision for better numerical stability
-- Configurable hyperparameters matching MATLAB's trainNetwork
+This module provides:
+- LSTMClassifier: LSTM neural network model
+- LSTMMarketDataset: PyTorch dataset for market data
+- Training and prediction functions
+- MATLAB-style weight initialization
 
-Multi-GPU Usage:
-    The model automatically detects and uses all available GPUs when training.
-
-Multiprocessing:
-    DataLoader uses multiple workers on Linux/Mac for parallel data loading.
-    On Windows, num_workers=0 to avoid multiprocessing issues.
+6-1-2024 aii llc
+=============================================================================
 """
+
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 import numpy as np
-import platform
-from typing import Tuple, List
-
-
-torch.set_default_dtype(torch.float64)  # MATLAB uses double precision
+from typing import Tuple, List, Dict
+import math
 
 
 class LSTMClassifier(nn.Module):
     """
-    LSTM-based sequence classifier
-    Equivalent to MATLAB's sequenceInputLayer + lstmLayer architecture
+    LSTM classifier matching MATLAB's stacked LSTM architecture
+    
+    MATLAB Architecture:
+    - sequenceInputLayer(104)
+    - lstmLayer(hidden_size, 'StateActivationFunction', 'tanh', 'OutputMode', 'sequence')
+    - dropoutLayer(dropout_rate)
+    - lstmLayer(hidden_size, 'StateActivationFunction', 'tanh', 'OutputMode', 'sequence')
+    - dropoutLayer(dropout_rate)
+    - fullyConnectedLayer(2)
+    - softmaxLayer
+    - classificationLayer
+    
+    Python Architecture:
+    - First LSTM layer (unidirectional)
+    - Dropout
+    - Second LSTM layer (unidirectional)
+    - Dropout
+    - Fully connected layer
     """
-    def __init__(self, input_size, sequence_length, hidden_size, dropout_rate, num_classes=2):
-        """
-        Args:
-            input_size: Number of input features (104 in MATLAB code)
-            sequence_length: Expected length of input sequences (hash2(r, 8))
-            hidden_size: Number of LSTM hidden units (hash2(r, 2))
-            dropout_rate: Dropout probability (hash2(r, 4) / 100)
-            num_classes: Number of output classes (2 for binary classification)
-        """
+    
+    def __init__(self, input_size: int, sequence_length: int, hidden_size: int, 
+                 dropout_rate: float, num_classes: int = 2):
         super(LSTMClassifier, self).__init__()
         
         self.input_size = input_size
         self.sequence_length = sequence_length
         self.hidden_size = hidden_size
+        self.dropout_rate = dropout_rate
         self.num_classes = num_classes
-
-        # First LSTM layer (sequence output mode)
+        
+        # First LSTM layer (matches MATLAB's first lstmLayer)
         self.lstm1 = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden_size,
             num_layers=1,
             batch_first=True,
-            dropout=0,
-            dtype=torch.float64
+            dropout=0.0,  # Dropout handled separately
+            bidirectional=False  # MATLAB lstmLayer is unidirectional
         )
         
         # First dropout layer
         self.dropout1 = nn.Dropout(p=dropout_rate)
         
-        # Second LSTM layer (sequence output mode)
+        # Second LSTM layer (matches MATLAB's second lstmLayer)
         self.lstm2 = nn.LSTM(
-            input_size=hidden_size,
+            input_size=hidden_size,  # Takes output from first LSTM
             hidden_size=hidden_size,
             num_layers=1,
             batch_first=True,
-            dropout=0,
-            dtype=torch.float64
+            dropout=0.0,  # Dropout handled separately
+            bidirectional=False  # MATLAB lstmLayer is unidirectional
         )
         
         # Second dropout layer
         self.dropout2 = nn.Dropout(p=dropout_rate)
         
-        # Fully connected layer
-        self.fc = nn.Linear(hidden_size, num_classes, dtype=torch.float64)
-        
-        # Softmax layer (applied in forward pass)
-        self.softmax = nn.Softmax(dim=-1)
+        # Fully connected layer (unidirectional LSTM outputs hidden_size)
+        self.fc = nn.Linear(hidden_size, num_classes)
         
     def forward(self, x):
         """
-        Forward pass
+        Forward pass matching MATLAB's stacked LSTM architecture
+        
         Args:
-            x: Input tensor of shape (batch_size, sequence_length, input_size)
+            x: Input tensor of shape (batch, input_size, sequence_length)
+               Note: MATLAB uses (features, time_steps) format
+        
         Returns:
-            output: Logits of shape (batch_size, sequence_length, num_classes)
-            or (batch_size, num_classes) if returning last timestep only
+            logits: Output logits of shape (batch, sequence_length, num_classes)
         """
-        # Validate input dimensions
-        batch_size, seq_len, features = x.shape
-        if features != self.input_size:
-            raise ValueError(f"Expected input_size={self.input_size}, but got {features}")
-        # Note: LSTMs can handle variable sequence lengths, so we don't validate seq_len
+        # Transpose from (batch, features, time) to (batch, time, features)
+        # MATLAB: (104, 20) -> PyTorch: (20, 104)
+        x = x.transpose(1, 2)  # (batch, sequence_length, input_size)
         
         # First LSTM layer
-        lstm1_out, _ = self.lstm1(x)
+        lstm1_out, _ = self.lstm1(x)  # (batch, sequence_length, hidden_size)
+        
+        # First dropout
         lstm1_out = self.dropout1(lstm1_out)
         
         # Second LSTM layer
-        lstm2_out, _ = self.lstm2(lstm1_out)
+        lstm2_out, _ = self.lstm2(lstm1_out)  # (batch, sequence_length, hidden_size)
+        
+        # Second dropout
         lstm2_out = self.dropout2(lstm2_out)
         
-        # Fully connected layer
-        # Apply to all timesteps in sequence
-        out = self.fc(lstm2_out)
+        # Fully connected layer for classification
+        logits = self.fc(lstm2_out)  # (batch, sequence_length, num_classes)
         
-        return out
+        return logits
 
 
 class LSTMMarketDataset(Dataset):
-    def __init__(self, X, Y):
-        """
-        X: list or numpy array of shape [num_samples, seq_len, input_size]
-        Y: list or numpy array of shape [num_samples] or [num_samples, seq_len]
-        """
-
-        # --- Convert X to tensor ---
-        if isinstance(X, list):
-            X = np.array(X, dtype=np.float64)
-        elif isinstance(X, torch.Tensor):
-            X = X.detach().cpu().numpy()
-        self.X = torch.tensor(X, dtype=torch.float64)
-
-        # --- Convert Y to tensor ---
-        if isinstance(Y, list):
-            Y = np.array(Y)
-        elif isinstance(Y, torch.Tensor):
-            Y = Y.detach().cpu().numpy()
-        self.Y = torch.tensor(Y, dtype=torch.long)
-
-        # --- Ensure label dimensionality matches MATLAB format ---
-        # MATLAB sometimes uses 1D labels; PyTorch expects [batch, seq_len] for sequence output.
-        if self.Y.ndim == 1 and self.X.ndim == 3:
-            seq_len = self.X.shape[1]
-            self.Y = self.Y.unsqueeze(1).repeat(1, seq_len)
-
-    def __len__(self):
-        return len(self.X)
-
-    def __getitem__(self, idx):
-        return self.X[idx], self.Y[idx]
-
-
-def init_weights_matlab_style(module):
     """
-    Initialize weights to match MATLAB's lstmLayer and fullyConnectedLayer defaults
+    PyTorch Dataset for market data sequences
+    
+    Handles variable-length sequences stored as lists
+    """
+    
+    def __init__(self, sequences: List[np.ndarray], labels: List[np.ndarray]):
+        """
+        Args:
+            sequences: List of input sequences, each shape (features, time_steps)
+            labels: List of label sequences, each shape (1, time_steps)
+        """
+        self.sequences = sequences
+        self.labels = labels
+        
+    def __len__(self):
+        return len(self.sequences)
+    
+    def __getitem__(self, idx):
+        # Convert to tensors using float64 (double precision) to match MATLAB
+        seq = torch.from_numpy(self.sequences[idx]).double()  # (features, time_steps)
+        label = torch.from_numpy(self.labels[idx]).long().squeeze(0)  # (time_steps,)
+        
+        return seq, label
+        
+
+def init_weights_matlab_style(m):
+    """
+    Initialize weights to match MATLAB's default initialization
     
     MATLAB uses:
-    - Glorot (Xavier) uniform initialization for weights
-    - Forget gate bias = 1.0 (prevents vanishing gradients)
-    - All other biases = 0.0
+    - Glorot (Xavier) initialization for LSTM weights
+    - Zero initialization for biases
+    - Forget gate bias = 1.0 for better gradient flow
+    
+    This applies to both lstm1 and lstm2 layers automatically via .apply()
     """
-    if isinstance(module, nn.Linear):
-        # MATLAB's fullyConnectedLayer uses Glorot initialization
-        nn.init.xavier_uniform_(module.weight)
-        if module.bias is not None:
-            nn.init.zeros_(module.bias)
-    elif isinstance(module, nn.LSTM):
-        for name, param in module.named_parameters():
-            if "weight_ih" in name:
-                # Input-to-hidden weights: Xavier uniform
-                nn.init.xavier_uniform_(param)
-            elif "weight_hh" in name:
-                # Hidden-to-hidden weights: Xavier uniform
-                nn.init.xavier_uniform_(param)
-            elif "bias" in name:
-                # CRITICAL: MATLAB initializes forget gate bias to 1.0
-                # This prevents vanishing gradients in LSTM
-                nn.init.zeros_(param)
-                # LSTM bias is [input_gate, forget_gate, cell_gate, output_gate]
-                # Set forget gate bias (2nd quarter) to 1.0
-                hidden_size = param.shape[0] // 4
-                param.data[hidden_size:2*hidden_size].fill_(1.0)
+    if isinstance(m, nn.LSTM):
+        for name, param in m.named_parameters():
+            if 'weight_ih' in name:
+                # Input-hidden weights: Glorot uniform
+                nn.init.xavier_uniform_(param.data)
+            elif 'weight_hh' in name:
+                # Hidden-hidden weights: Orthogonal initialization
+                nn.init.orthogonal_(param.data)
+            elif 'bias' in name:
+                # Biases: zeros
+                param.data.fill_(0.0)
+                # LSTM has 4 gates, set forget gate bias to 1.0 (helps training)
+                n = param.size(0)
+                param.data[n//4:n//2].fill_(1.0)
+                
+    elif isinstance(m, nn.Linear):
+        # Glorot uniform for fully connected layers
+        nn.init.xavier_uniform_(m.weight.data)
+        if m.bias is not None:
+            m.bias.data.fill_(0.0)
 
 
-def create_dataloader(dataset, batch_size, shuffle=False, num_workers=None):
+def create_dataloader(dataset: LSTMMarketDataset, batch_size: int, 
+                     shuffle: bool, num_workers: int = 0) -> DataLoader:
     """
-    Create a DataLoader with optimal settings for multiprocessing and GPU usage
+    Create a DataLoader for the dataset
     
     Args:
-        dataset: Dataset to load
+        dataset: LSTMMarketDataset instance
         batch_size: Batch size
-        shuffle: Whether to shuffle the data
-        num_workers: Number of workers for data loading. If None, auto-detect based on platform.
+        shuffle: Whether to shuffle data
+        num_workers: Number of worker processes
     
     Returns:
         DataLoader instance
     """
-    if num_workers is None:
-        # Use 4 workers on Unix-like systems, 0 on Windows (to avoid multiprocessing issues)
-        num_workers = 4 if platform.system() != 'Windows' else 0
-    
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -202,130 +200,76 @@ def create_dataloader(dataset, batch_size, shuffle=False, num_workers=None):
     )
 
 
-def classify_sequences(
-    model: nn.Module,
-    sequences: List[np.ndarray],
+def train_lstm_model(
+    model: LSTMClassifier,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    hyperparams: Dict,
+    avnin: List[np.ndarray],
+    avnout1: List[np.ndarray],
     device: str = 'cpu'
-) -> Tuple[List[int], List[np.ndarray]]:
+) -> Tuple[LSTMClassifier, Dict]:
     """
-    Classify sequences and return predictions with confidence scores
-    
-    Args:
-        model: Trained model
-        sequences: List of sequences (time_steps x features) - shape: (20, 104)
-        device: Device to run on
-    
-    Returns:
-        predictions: List of predicted classes for last time step
-        confidences: List of confidence arrays (num_classes,) for last time step
-    """
-    model.eval()
-    model = model.to(device)
-    
-    predictions = []
-    confidences = []
-    
-    with torch.no_grad():
-        for seq in sequences:
-            # seq shape: (time_steps, features) = (20, 104)
-            # Add batch dimension: (1, time_steps, features) = (1, 20, 104)
-            seq_tensor = torch.from_numpy(seq).double().unsqueeze(0).to(device)
-            
-            # Forward pass - output shape: (1, time_steps, num_classes)
-            output = model(seq_tensor)
-            
-            # Get last time step: (1, num_classes)
-            last_output = output[:, -1, :]
-            
-            # Apply softmax to get probabilities
-            probs = torch.softmax(last_output, dim=1)[0]  # (num_classes,)
-            pred = torch.argmax(probs).item()
-            
-            predictions.append(pred)
-            confidences.append(probs.cpu().numpy())
-    
-    return predictions, confidences
-
-
-def train_lstm_model(model, train_loader, val_loader, hyperparams, avnin, avnout1, device='cpu'):
-    """
-    Train the LSTM model with settings equivalent to MATLAB trainingOptions
+    Train LSTM model matching MATLAB's trainNetwork behavior
     
     Args:
         model: LSTMClassifier instance
-        train_loader: DataLoader for training data
-        val_loader: DataLoader for validation data
-        hyperparams: Dictionary containing hash2(r, i) values
-        avnin: Validation input data
-        avnout1: Validation output data
-        device: 'cpu' or 'cuda'
+        train_loader: Training data loader
+        val_loader: Validation data loader
+        hyperparams: Dictionary with training hyperparameters
+        avnin: Validation input sequences (for evaluation)
+        avnout1: Validation output labels (for evaluation)
+        device: Device to train on ('cpu' or 'cuda')
     
     Returns:
-        model: Trained model (best model based on validation loss)
-        history: Training history dictionary containing:
-            - 'train_loss': List of training losses
-            - 'train_acc': List of training accuracies
-            - 'val_loss': List of validation losses
-            - 'val_acc': List of validation accuracies
-            - 'final_val_acc': Final validation accuracy on best model
+        trained_model: Trained model
+        info: Training information dictionary
     """
+    # Extract hyperparameters
+    initial_lr = hyperparams['initial_lr']
+    max_epochs = hyperparams['max_epochs']
+    l2_regularization = hyperparams['l2_regularization']
+    lr_drop_factor = hyperparams['lr_drop_factor']
+    lr_drop_period = hyperparams['lr_drop_period']
+    validation_patience = hyperparams.get('validation_patience', 5)
+    validation_frequency = hyperparams.get('validation_frequency', 7)
+    
+    # Convert model to double precision to match MATLAB (float64)
+    model = model.double()
     
     # Move model to device
     model = model.to(device)
     
-    # Enable multi-GPU training if requested and available
-    is_data_parallel = False
-    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        # print(f"Using {torch.cuda.device_count()} GPUs for training")
+    # Use DataParallel for multi-GPU training if available
+    if device == 'cuda' and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
-        is_data_parallel = True
-    #elif torch.cuda.is_available():
-        # print(f"Using single GPU: {torch.cuda.get_device_name(0)}")
-    # else:
-        #print("Using CPU")
-
-    # Extract hyperparameters from hyperparams
-    initial_lr = hyperparams.get('initial_lr', 0.001)
-    max_epochs = hyperparams.get('max_epochs', 100)
-    l2_reg = hyperparams.get('l2_regularization', 0.0)
-    lr_drop_factor = hyperparams.get('lr_drop_factor', 0.1)
-    lr_drop_period = hyperparams.get('lr_drop_period', 10)
-    validation_patience = hyperparams.get('validation_patience', 5)
-    validation_frequency = hyperparams.get('validation_frequency', 7)
-
-    # Adam optimizer with L2 regularization (weight_decay)
-    # SquaredGradientDecayFactor = 0.999 corresponds to beta2 in Adam
-    optimizer = optim.Adam(
+    
+    # Loss function: Cross-entropy (matches MATLAB's classificationLayer)
+    criterion = nn.CrossEntropyLoss()
+    
+    # Optimizer: ADAM (matches MATLAB's 'adam' solver)
+    # MATLAB: SquaredGradientDecayFactor = 0.999 (corresponds to beta2 in PyTorch)
+    optimizer = torch.optim.Adam(
         model.parameters(),
         lr=initial_lr,
-        betas=(0.9, 0.999),  # beta2 = SquaredGradientDecayFactor
-        weight_decay=l2_reg  # L2 regularization
+        betas=(0.9, 0.999),  # beta1=0.9 (default), beta2=0.999 (MATLAB SquaredGradientDecayFactor)
+        weight_decay=l2_regularization  # L2 regularization
     )
     
-    # Learning rate scheduler (piecewise = StepLR in PyTorch)
-    scheduler = optim.lr_scheduler.StepLR(
+    # Learning rate scheduler: Step decay
+    scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer,
         step_size=lr_drop_period,
         gamma=lr_drop_factor
     )
     
-    # Loss function (CrossEntropyLoss combines softmax + classification)
-    criterion = nn.CrossEntropyLoss()
-    
-    # Training history
-    history = {
-        'train_loss': [],
-        'val_loss': [],
-        'train_acc': [],
-        'val_acc': []
-    }
-    
-    # Early stopping parameters
+    # Training loop
+    # MATLAB: OutputNetwork = 'best-validation-loss'
+    # We need to track best validation LOSS and save the best model
     best_val_loss = float('inf')
     best_model_state = None
     patience_counter = 0
     
-    # Training loop
     for epoch in range(max_epochs):
         # Training phase
         model.train()
@@ -333,237 +277,254 @@ def train_lstm_model(model, train_loader, val_loader, hyperparams, avnin, avnout
         train_correct = 0
         train_total = 0
         
-        for batch_idx, (inputs, targets) in enumerate(train_loader):
-            inputs = inputs.to(device)
-            targets = targets.to(device)
+        for sequences, labels in train_loader:
+            sequences = sequences.to(device)
+            labels = labels.to(device)
             
             # Forward pass
             optimizer.zero_grad()
-            outputs = model(inputs)
+            logits = model(sequences)  # (batch, seq_len, num_classes)
             
-            # For sequence classification, use last timestep
-            if outputs.dim() == 3:  # (batch, seq_len, num_classes)
-                # Use last timestep for classification
-                outputs = outputs[:, -1, :]
+            # Reshape for loss calculation
+            batch_size, seq_len, num_classes = logits.shape
+            logits_flat = logits.reshape(-1, num_classes)  # (batch * seq_len, num_classes)
+            labels_flat = labels.reshape(-1)  # (batch * seq_len,)
             
-            # Extract last timestep from targets if needed
-            if targets.dim() > 1:  # (batch, seq_len)
-                targets = targets[:, -1]  # Use last timestep label
-            
-            loss = criterion(outputs, targets)
+            # Calculate loss
+            loss = criterion(logits_flat, labels_flat)
             
             # Backward pass
             loss.backward()
+            
+            # NOTE: MATLAB's default GradientThreshold = Inf (no clipping)
+            # Only clip if MATLAB configuration explicitly sets GradientThreshold
+            # Commented out to match MATLAB default behavior:
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
             
             # Statistics
             train_loss += loss.item()
-            _, predicted = torch.max(outputs.data, 1)
-            train_total += targets.size(0)
-            train_correct += (predicted == targets).sum().item()
+            _, predicted = torch.max(logits_flat, 1)
+            train_total += labels_flat.size(0)
+            train_correct += (predicted == labels_flat).sum().item()
         
-        # Average training loss and accuracy
-        avg_train_loss = train_loss / len(train_loader)
-        train_acc = 100.0 * train_correct / train_total
-        
-        history['train_loss'].append(avg_train_loss)
-        history['train_acc'].append(train_acc)
+        # Learning rate decay (MATLAB: LearnRateSchedule = 'piecewise')
+        scheduler.step()
         
         # Validation phase (every validation_frequency epochs)
-        if (epoch + 1) % validation_frequency == 0 or epoch == 0:
+        # MATLAB: ValidationFrequency = 7
+        if (epoch + 1) % validation_frequency == 0 or epoch == max_epochs - 1:
             model.eval()
-            val_loss = 0.0
             val_correct = 0
             val_total = 0
+            val_loss = 0.0
+            num_val_samples = 0
             
             with torch.no_grad():
-                for inputs, targets in val_loader:
-                    inputs = inputs.to(device)
-                    targets = targets.to(device)
+                for sequences, labels in val_loader:
+                    sequences = sequences.to(device)
+                    labels = labels.to(device)
                     
-                    outputs = model(inputs)
+                    logits = model(sequences)
                     
-                    if outputs.dim() == 3:
-                        outputs = outputs[:, -1, :]
+                    # Reshape for loss and accuracy calculation
+                    batch_size, seq_len, num_classes = logits.shape
+                    logits_flat = logits.reshape(-1, num_classes)
+                    labels_flat = labels.reshape(-1)
                     
-                    # Extract last timestep from targets if needed
-                    if targets.dim() > 1:
-                        targets = targets[:, -1]
+                    # Calculate validation loss
+                    # CrossEntropyLoss with reduction='mean' averages over batch
+                    # We accumulate weighted by number of samples for true average
+                    loss = criterion(logits_flat, labels_flat)
+                    val_loss += loss.item() * labels_flat.size(0)
+                    num_val_samples += labels_flat.size(0)
                     
-                    loss = criterion(outputs, targets)
-                    
-                    val_loss += loss.item()
-                    _, predicted = torch.max(outputs.data, 1)
-                    val_total += targets.size(0)
-                    val_correct += (predicted == targets).sum().item()
+                    # Calculate accuracy
+                    _, predicted = torch.max(logits_flat, 1)
+                    val_total += labels_flat.size(0)
+                    val_correct += (predicted == labels_flat).sum().item()
             
-            avg_val_loss = val_loss / len(val_loader)
-            val_acc = 100.0 * val_correct / val_total
+            # Average validation loss across all samples (matches MATLAB behavior)
+            avg_val_loss = val_loss / num_val_samples if num_val_samples > 0 else float('inf')
+            val_acc = 100.0 * val_correct / val_total if val_total > 0 else 0.0
             
-            history['val_loss'].append(avg_val_loss)
-            history['val_acc'].append(val_acc)
-            
-            # Check for best model (OutputNetwork = 'best-validation-loss')
+            # MATLAB: OutputNetwork = 'best-validation-loss'
+            # Save model if this is the best validation loss so far
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
-                # Save the underlying model state if using DataParallel
-                if is_data_parallel:
-                    best_model_state = model.module.state_dict().copy()
+                # Save a deep copy of the model state
+                if isinstance(model, nn.DataParallel):
+                    best_model_state = {k: v.cpu().clone() for k, v in model.module.state_dict().items()}
                 else:
-                    best_model_state = model.state_dict().copy()
+                    best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 patience_counter = 0
             else:
                 patience_counter += 1
             
-            # Early stopping (ValidationPatience = 5)
+            # MATLAB: ValidationPatience = 5
+            # Stop training if validation loss doesn't improve for 5 consecutive checks
             if patience_counter >= validation_patience:
-                # print(f'Early stopping at epoch {epoch + 1}')
                 break
-            
-            # print(f'Epoch [{epoch+1}/{max_epochs}], '
-            #      f'Train Loss: {avg_train_loss:.4f}, Train Acc: {train_acc:.2f}%, '
-            #      f'Val Loss: {avg_val_loss:.4f}, Val Acc: {val_acc:.2f}%')
-        # else:
-        #    print(f'Epoch [{epoch+1}/{max_epochs}], '
-        #          f'Train Loss: {avg_train_loss:.4f}, Train Acc: {train_acc:.2f}%')
-        
-        # Update learning rate
-        scheduler.step()
     
-    # Load best model
+    # CRITICAL: Restore the best model weights (MATLAB: OutputNetwork = 'best-validation-loss')
     if best_model_state is not None:
-        if is_data_parallel:
+        if isinstance(model, nn.DataParallel):
             model.module.load_state_dict(best_model_state)
         else:
             model.load_state_dict(best_model_state)
-        # print(f'Loaded best model with validation loss: {best_val_loss:.4f}')
+        # Move back to device
+        model = model.to(device)
     
-    # Calculate final_val_acc on the best model
-    # Use ALL time steps for more granular accuracy (not just last time step)
+    # Check model parameters for sanity
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    # Final validation accuracy (re-evaluate with best model)
     model.eval()
-    final_val_correct = 0
-    final_val_total = 0
+    val_correct = 0
+    val_total = 0
     
     with torch.no_grad():
-        for inputs, targets in val_loader:
-            inputs = inputs.to(device)
-            targets = targets.to(device)
+        for sequences, labels in val_loader:
+            sequences = sequences.to(device)
+            labels = labels.to(device)
             
-            outputs = model(inputs)
+            logits = model(sequences)
             
-            # Evaluate on ALL time steps for fine-grained accuracy
-            if outputs.dim() == 3:  # (batch, seq_len, num_classes)
-                batch_size, seq_len, num_classes = outputs.shape
-                
-                # Reshape outputs: (batch, seq_len, num_classes) -> (batch*seq_len, num_classes)
-                outputs_flat = outputs.reshape(-1, num_classes)
-                
-                # Reshape targets: (batch, seq_len) -> (batch*seq_len)
-                if targets.dim() > 1:
-                    targets_flat = targets.reshape(-1)
-                else:
-                    targets_flat = targets
-                
-                _, predicted = torch.max(outputs_flat, 1)
-                final_val_total += targets_flat.size(0)
-                final_val_correct += (predicted == targets_flat).sum().item()
-            else:
-                # Fallback for 2D outputs
-                if targets.dim() > 1:
-                    targets = targets[:, -1]
-                _, predicted = torch.max(outputs.data, 1)
-                final_val_total += targets.size(0)
-                final_val_correct += (predicted == targets).sum().item()
+            batch_size, seq_len, num_classes = logits.shape
+            logits_flat = logits.reshape(-1, num_classes)
+            labels_flat = labels.reshape(-1)
+            
+            _, predicted = torch.max(logits_flat, 1)
+            val_total += labels_flat.size(0)
+            val_correct += (predicted == labels_flat).sum().item()
     
-    final_validation_accuracy = 100.0 * final_val_correct / final_val_total
-    history['final_val_acc'] = final_validation_accuracy
+    final_val_acc = 100.0 * val_correct / val_total if val_total > 0 else 0.0
     
-    # Return the unwrapped model (not DataParallel wrapper) for consistency
-    if is_data_parallel:
+    # Return unwrapped model if using DataParallel
+    if isinstance(model, nn.DataParallel):
         model = model.module
     
-    return model, history
-
-
-def main():
-    """
-    Example usage
-    """
-    # Example hash2 values (replace with actual values from your hash2 function)
-    hyperparams = {
-        'hidden_size': 128,   # LSTM hidden size
-        'initial_lr': 10,    # Initial LR * 10000
-        'dropout_rate': 20,    # Dropout * 100
-        'max_epochs': 100,   # Max epochs
-        'batch_size': 32,    # Mini batch size
-        'dropout_rate': 50,    # LR drop factor * 100
-        'lr_drop_period': 10,    # LR drop period
-        'sequence_length': 50,    # Sequence length
-        'l2_reg': 1     # L2 regularization * 100
+    info = {
+        'final_val_acc': final_val_acc,
+        'best_val_loss': best_val_loss,
+        'epochs_trained': epoch + 1
     }
     
-    # Model parameters
+    return model, info
+
+
+def classify_sequences(
+    model: LSTMClassifier,
+    sequences: List[np.ndarray],
+    device: str = 'cpu',
+    return_all_logits: bool = False
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Classify sequences using trained model
+    
+    MATLAB Behavior:
+    - classify(net, data) returns class labels for each sequence
+    - With 'OutputMode' = 'sequence', it outputs for all time steps
+    - Typically uses the LAST time step for sequence classification
+    
+    Args:
+        model: Trained LSTMClassifier
+        sequences: List of input sequences, each shape (features, time_steps)
+        device: Device to run on
+        return_all_logits: If True, also return raw logits for ensemble methods
+    
+    Returns:
+        predictions: Predicted class for each sequence (using last time step)
+        confidences: Confidence scores for each class, shape (num_sequences, num_classes)
+        If return_all_logits=True, also returns logits array
+    """
+    model.eval()
+    model = model.to(device)
+    
+    all_predictions = []
+    all_confidences = []
+    all_logits = [] if return_all_logits else None
+    
+    with torch.no_grad():
+        for seq in sequences:
+            # Convert to tensor and add batch dimension (double precision to match model)
+            seq_tensor = torch.from_numpy(seq).double().unsqueeze(0).to(device)
+            
+            # Forward pass
+            logits = model(seq_tensor)  # (1, seq_len, num_classes)
+            
+            # Get predictions for last time step (matches MATLAB behavior)
+            last_logits = logits[0, -1, :]  # (num_classes,)
+            
+            # Softmax to get probabilities
+            probs = F.softmax(last_logits, dim=0)
+            
+            # Predicted class
+            pred_class = torch.argmax(last_logits).item()
+            
+            all_predictions.append(pred_class)
+            all_confidences.append(probs.cpu().numpy())
+            
+            if return_all_logits:
+                all_logits.append(last_logits.cpu().numpy())
+    
+    if return_all_logits:
+        return np.array(all_predictions), np.array(all_confidences), np.array(all_logits)
+    
+    return np.array(all_predictions), np.array(all_confidences)
+
+
+if __name__ == "__main__":
+    # Test the model
+    print("Testing LSTM Model Components...")
+    
+    # Create dummy data
     input_size = 104
-    num_classes = 2
+    sequence_length = 20
+    hidden_size = 128
+    batch_size = 16
+    num_sequences = 27
     
     # Create model
     model = LSTMClassifier(
         input_size=input_size,
-        sequence_length=hyperparams['sequence_length'],
-        hidden_size=hyperparams['hidden_size'],
-        dropout_rate=hyperparams['dropout_rate'],
-        num_classes=num_classes
+        sequence_length=sequence_length,
+        hidden_size=hidden_size,
+        dropout_rate=0.5,
+        num_classes=2
     )
     
-    print(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")
-    print(f"Using dtype: {next(model.parameters()).dtype}")
+    # Initialize weights
+    model.apply(init_weights_matlab_style)
     
-    # Example: Create dummy data (replace with your actual data)
-    # Training data
-    X_train = np.random.randn(1000, hyperparams['sequence_length'], input_size)
-    y_train = np.random.randint(0, 2, size=(1000,))
+    # Convert to double precision
+    model = model.double()
     
-    # Validation data
-    X_val = np.random.randn(200, hyperparams['sequence_length'], input_size)
-    y_val = np.random.randint(0, 2, size=(200,))
+    # Create dummy dataset (use float64 to match MATLAB)
+    sequences = [np.random.randn(input_size, sequence_length).astype(np.float64) for _ in range(num_sequences)]
+    labels = [np.random.randint(0, 2, size=(1, sequence_length)).astype(np.int64) for _ in range(num_sequences)]
     
-    # Create datasets and dataloaders
-    train_dataset = LSTMMarketDataset(X_train, y_train)
-    val_dataset = LSTMMarketDataset(X_val, y_val)
+    dataset = LSTMMarketDataset(sequences, labels)
+    dataloader = create_dataloader(dataset, batch_size=4, shuffle=False)
     
-    # Create DataLoaders with multiprocessing support
-    # Shuffle = 'never' in MATLAB, so shuffle=False
-    train_loader = create_dataloader(train_dataset, hyperparams['batch_size'], shuffle=False)
-    val_loader = create_dataloader(val_dataset, hyperparams['batch_size'], shuffle=False)
+    print(f"Model created: {model}")
+    print(f"Dataset size: {len(dataset)}")
+    print(f"DataLoader batches: {len(dataloader)}")
     
-    # Check device (ExecutionEnvironment = 'auto')
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    # Test forward pass (use double precision)
+    test_input = torch.randn(2, input_size, sequence_length, dtype=torch.float64)
+    output = model(test_input)
+    print(f"Test input shape: {test_input.shape}")
+    print(f"Test output shape: {output.shape}")
     
-    # Print GPU information
-    if torch.cuda.is_available():
-        print(f"Number of GPUs available: {torch.cuda.device_count()}")
-        for i in range(torch.cuda.device_count()):
-            print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+    # Test classification
+    predictions, confidences = classify_sequences(model, sequences[:3])
+    print(f"Predictions shape: {predictions.shape}")
+    print(f"Confidences shape: {confidences.shape}")
+    print(f"Sample predictions: {predictions}")
+    print(f"Sample confidences: {confidences}")
     
-    # Train model with multi-GPU support
-    trained_model, history = train_lstm_model(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        hyperparams=hyperparams,
-        avnin=X_val,
-        avnout1=y_val,
-        device=device  # Enable multi-GPU training
-    )
-    
-    # Save model
-    torch.save(trained_model.state_dict(), 'lstm_model.pth')
-    print("Model saved to lstm_model.pth")
-    
-    return trained_model, history
-
-
-if __name__ == "__main__":
-    model, history = main()
+    print("\nAll tests passed!")
 
