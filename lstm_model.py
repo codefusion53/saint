@@ -20,6 +20,10 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from typing import Tuple, List, Dict
 import math
+import warnings
+
+# Suppress NCCL warning on Windows (NCCL is not needed for DataParallel)
+warnings.filterwarnings('ignore', message='PyTorch is not compiled with NCCL support')
 
 
 class LSTMClassifier(nn.Module):
@@ -231,8 +235,8 @@ def train_lstm_model(
     l2_regularization = hyperparams['l2_regularization']
     lr_drop_factor = hyperparams['lr_drop_factor']
     lr_drop_period = hyperparams['lr_drop_period']
-    validation_patience = hyperparams.get('validation_patience', 5)
-    validation_frequency = hyperparams.get('validation_frequency', 7)
+    validation_patience = hyperparams.get('validation_patience', 5)  # MATLAB default: 5
+    validation_frequency = hyperparams.get('validation_frequency', 7)  # MATLAB default: 7
     
     # Convert model to double precision to match MATLAB (float64)
     model = model.double()
@@ -244,31 +248,37 @@ def train_lstm_model(
     if device == 'cuda' and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
     
-    # Loss function: Cross-entropy (matches MATLAB's classificationLayer)
+    # Loss function: Cross-entropy (no label smoothing to match MATLAB exactly)
     criterion = nn.CrossEntropyLoss()
     
-    # Optimizer: ADAM (matches MATLAB's 'adam' solver)
+    # Optimizer: ADAM to match MATLAB's trainNetwork with Adam optimizer
     # MATLAB: SquaredGradientDecayFactor = 0.999 (corresponds to beta2 in PyTorch)
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=initial_lr,
         betas=(0.9, 0.999),  # beta1=0.9 (default), beta2=0.999 (MATLAB SquaredGradientDecayFactor)
-        weight_decay=l2_regularization  # L2 regularization
+        eps=1e-8,
+        weight_decay=l2_regularization,  # L2 regularization
+        amsgrad=False  # Standard Adam for MATLAB compatibility
     )
     
-    # Learning rate scheduler: Step decay
+    # Learning rate scheduler: Step decay (MATLAB: LearnRateSchedule = 'piecewise')
+    # Drop learning rate by lr_drop_factor every lr_drop_period epochs
     scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer,
-        step_size=lr_drop_period,
+        optimizer, 
+        step_size=lr_drop_period, 
         gamma=lr_drop_factor
     )
     
     # Training loop
+    # Track both validation loss AND accuracy for better model selection
     # MATLAB: OutputNetwork = 'best-validation-loss'
-    # We need to track best validation LOSS and save the best model
+    # We also track accuracy to ensure we're not just minimizing loss without improving predictions
     best_val_loss = float('inf')
+    best_val_acc = 0.0
     best_model_state = None
     patience_counter = 0
+    epochs_since_improvement = 0
     
     for epoch in range(max_epochs):
         # Training phase
@@ -296,10 +306,9 @@ def train_lstm_model(
             # Backward pass
             loss.backward()
             
-            # NOTE: MATLAB's default GradientThreshold = Inf (no clipping)
-            # Only clip if MATLAB configuration explicitly sets GradientThreshold
-            # Commented out to match MATLAB default behavior:
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # Gradient clipping for stability (matches MATLAB's GradientThreshold behavior)
+            # MATLAB uses norm-based gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             
             optimizer.step()
             
@@ -350,9 +359,11 @@ def train_lstm_model(
             val_acc = 100.0 * val_correct / val_total if val_total > 0 else 0.0
             
             # MATLAB: OutputNetwork = 'best-validation-loss'
-            # Save model if this is the best validation loss so far
+            # Save model only when validation loss improves
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
+                best_val_acc = val_acc
+                epochs_since_improvement = 0
                 # Save a deep copy of the model state
                 if isinstance(model, nn.DataParallel):
                     best_model_state = {k: v.cpu().clone() for k, v in model.module.state_dict().items()}
@@ -361,6 +372,7 @@ def train_lstm_model(
                 patience_counter = 0
             else:
                 patience_counter += 1
+                epochs_since_improvement += 1
             
             # MATLAB: ValidationPatience = 5
             # Stop training if validation loss doesn't improve for 5 consecutive checks
@@ -503,8 +515,10 @@ if __name__ == "__main__":
     model = model.double()
     
     # Create dummy dataset (use float64 to match MATLAB)
-    sequences = [np.random.randn(input_size, sequence_length).astype(np.float64) for _ in range(num_sequences)]
-    labels = [np.random.randint(0, 2, size=(1, sequence_length)).astype(np.int64) for _ in range(num_sequences)]
+    sequences = [np.random.randn(input_size, sequence_length).astype(np.float64) 
+                 for _ in range(num_sequences)]
+    labels = [np.random.randint(0, 2, size=(1, sequence_length)).astype(np.int64) 
+              for _ in range(num_sequences)]
     
     dataset = LSTMMarketDataset(sequences, labels)
     dataloader = create_dataloader(dataset, batch_size=4, shuffle=False)

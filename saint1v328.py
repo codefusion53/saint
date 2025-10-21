@@ -25,6 +25,10 @@ import signal
 import sys
 import atexit
 import psutil  # For aggressive process cleanup
+import warnings
+
+# Suppress NCCL warning on Windows (NCCL is not needed for DataParallel)
+warnings.filterwarnings('ignore', message='PyTorch is not compiled with NCCL support')
 
 from loaddata28 import loaddata28
 from loaddata228 import loaddata228
@@ -259,8 +263,8 @@ def optoai(
         'l2_regularization': l2_reg,
         'lr_drop_factor': lr_drop_factor,
         'lr_drop_period': lr_drop_period,
-        'validation_patience': 5,
-        'validation_frequency': 7
+        'validation_patience': 5,  # MATLAB default
+        'validation_frequency': 7  # MATLAB default
     }
     
     # START TIMING: Measure only the actual training time for THIS process
@@ -315,32 +319,16 @@ def optoai(
     # Make predictions
     predictions, confidences, all_logits = classify_sequences(trained_model, pdata, device, return_all_logits=True)
     
-    # CRITICAL DECISION: Which sequence(s) to use for final prediction?
-    # Testing different approaches to find best MATLAB match:
+    # MATLAB MATCHING STRATEGY: Use only the LAST sequence (most recent)
+    # MATLAB's classify() function processes sequences independently
+    # The last sequence (sequence 26, index -1) contains the most recent data
+    # and is the standard approach for time series prediction
+    pred_class = predictions[-1]  # Use last sequence prediction
+    conf = confidences[-1]  # Use last sequence confidence
     
-    # Approach 1: Single sequence (sequence 26 = most recent)
-    pred_class_seq26 = predictions[26]
-    conf_seq26 = confidences[26]
-    
-    # Approach 2: Ensemble - average logits across ALL 27 sequences
-    # This might better match MATLAB's cell array behavior
-    avg_logits = np.mean(all_logits, axis=0)  # Average across all sequences
-    avg_probs = np.exp(avg_logits) / np.sum(np.exp(avg_logits))  # Softmax
-    pred_class_ensemble = int(np.argmax(avg_logits))
-    
-    # Approach 3: Mode (most common prediction)
-    votes = np.bincount(predictions, minlength=2)
-    pred_class_mode = int(np.argmax(votes))
-    
-    # USE ENSEMBLE APPROACH (averaging logits across all 27 sequences)
-    # This likely matches MATLAB's behavior when training with cell arrays
-    pred_class = pred_class_ensemble
-    conf = avg_probs  # Use ensemble probabilities
-    
-    # CRITICAL: MATLAB reports MINORITY class probability, not predicted class!
-    # For [0.82, 0.18] probabilities, MATLAB reports 0.18 (the MIN), not 0.82
-    # This is why MATLAB values can be < 0.5 and have mean ~0.46
-    h1 = float(np.min(conf))  # Minority class probability (matches MATLAB behavior)
+    # MATLAB confidence: Use the probability of the PREDICTED class
+    # This gives the model's confidence in its prediction
+    h1 = float(conf[pred_class])  # Confidence in predicted class
     
     # Evaluate prediction for betting
     # MATLAB: if k == height(t) + 1 (future prediction, no actual data)
@@ -542,9 +530,9 @@ def main():
         hpdata = np.zeros((14, 25), dtype=np.float64)
     
     # Mode configuration
-    prod = 0  # Production mode: 0 = development (use r1=0), 1 = production (use asset-specific r1)
-    # When prod=1, uses optimized hyperparameter row specific to each asset
-    # When prod=0, uses row 0 (first configuration) for testing
+    prod = 0  # Production mode: 0 = development (use r1=50), 1 = production (use asset-specific r1)
+    # When prod=1, uses optimized hyperparameter row specific to each asset (RECOMMENDED for best accuracy)
+    # When prod=0, uses row 50 for testing
     
     # Asset selection (5 = Gold Extended)
     asset_configs = {
@@ -649,22 +637,23 @@ def main():
     # Set hyperparameter row based on production mode  
     if prod == 1:
         # In production mode
-        # r=N-1 (0-based)
+        # Use asset-specific optimized row (0-based)
         r1 = config['r1']
-        r1 = max(0, r1)  # Subtract 1, but don't go negative
+        r1 = max(0, r1)
         mode_str = "PRODUCTION"
     else:
         # In development mode
+        # Use column 51 (0-based index 50) to match MATLAB comparison
         r1 = 50
         mode_str = "DEVELOPMENT"
     
-    r2 = r1
+    r2 = r1 - 1
     
     print(f"\nAsset: {uu}")
     print(f"Mode: {mode_str} (prod={prod})")
     print(f"Data file: {fname}")
     print(f"Target asset index (finf): {finf}")
-    print(f"Hyperparameter row: r={r2}")
+    print(f"Hyperparameter row: r={r2+1}")
     
     # Load data
     print("\nLoading data...")
@@ -698,8 +687,8 @@ def main():
 
     # IMPORTANT: Validate r2 is within hash2 bounds
     # If hash2 only has 1 row, we must use row 0
-    if r2 >= len(hash2):
-        print(f"WARNING: r2={r2} is out of bounds for hash2 with {len(hash2)} rows")
+    if r2 + 1 >= len(hash2):
+        print(f"WARNING: r2={r2+1} is out of bounds for hash2 with {len(hash2)} rows")
         print(f"         Using row 0 instead (the only available configuration)")
         r2 = 0
 
@@ -732,323 +721,352 @@ def main():
     # Main training loop
     # MATLAB uses 1-based indexing: r=50 means row 50 (the 50th row)
     # Python uses 0-based indexing: r=49 means row 49 (the 50th row)
-    # Since r2 is already 0-based after our validation, use it directly
-    r = r2 - 1  # Use hyperparameter row from asset config
-
-    print(f"\nStarting training with hyperparameter set {r+1}...")
+    # Process only the selected hyperparameter configuration (r2)
+    print(f"\nProcessing hyperparameter configuration r={r2+1} in 1-indexed)")
     print("="*70)
     
-    # Parallel processing configuration
-    # IMPORTANT: If workers get stuck and don't return results, set this to False
-    # For SPEED: Set to True (uses all GPUs if available)
-    # For RELIABILITY: Set to False (sequential, more stable on Windows)
-    use_parallel = True  # Set to True for parallel speed, False for sequential reliability
+    for r in range(r2, r2 + 1):
+        print(f"\nStarting training with hyperparameter set {r+1}/{len(hash2)}...")
+        print("="*70)
+        
+        # Parallel processing configuration
+        # IMPORTANT: If workers get stuck and don't return results, set this to False
+        # For SPEED: Set to True (uses all GPUs if available)
+        # For RELIABILITY: Set to False (sequential, more stable on Windows)
+        use_parallel = True  # Set to True for parallel speed, False for sequential reliability
     
-    # GPU worker configuration (only if device == 'cuda')
-    # If you get out-of-memory errors, reduce this number:
-    max_workers = 28
-    max_gpu_workers_override = 6  # Set to integer (e.g., 2) to manually limit GPU workers
-    
-    if use_parallel:
-        # Parallel processing
-        # GPU parallel processing: distribute workers across all GPUs
-        if device == 'cuda':
-            # Multi-GPU support
-            num_gpus = torch.cuda.device_count()
-            
-            if max_gpu_workers_override is not None:
-                # Use manual override
-                num_workers = max_gpu_workers_override
-                print(f"\n{num_gpus} GPU(s) detected")
-                print(f"Using {num_workers} parallel workers (MANUAL OVERRIDE)")
-            else:
-                # Automatic calculation based on total GPU memory across all GPUs
-                total_gpu_memory = sum(
-                    torch.cuda.get_device_properties(i).total_memory / (1024**3)
-                    for i in range(num_gpus)
-                )
-                
-                # Each worker needs ~1-2GB, distribute across all GPUs
-                max_workers_per_gpu = 16  # NUCLEAR: 16 workers per GPU for absolute maximum speed
-                max_gpu_workers = num_gpus * max_workers_per_gpu
-                num_workers = min(cpu_count(), max_gpu_workers, 16)  # Cap at 128 total for max throughput
-                
-                print(f"\n{num_gpus} GPU(s) detected (Total memory: {total_gpu_memory:.1f} GB)")
-                print(f"Using {num_workers} parallel workers")
-            
-            print(f"Note: All workers use GPU 0 as primary (Windows compatibility)")
-            print(f"      DataParallel distributes training across all {num_gpus} GPU(s) within each worker")
-            print(f"      Set max_gpu_workers_override if you get OOM errors")
-        else:
-            # CPU parallel processing: can use more workers
-            num_workers = min(cpu_count(), max_workers)
-            print(f"Using {num_workers} parallel workers (CPU cores available: {cpu_count()})")
-            print("Using CPU for parallel processing")
+        # GPU worker configuration (only if device == 'cuda')
+        # If you get out-of-memory errors, reduce this number:
+        max_workers = 28
+        max_gpu_workers_override = 6  # Set to integer (e.g., 2) to manually limit GPU workers
         
-        # Set environment variables to limit thread usage per worker
-        os.environ['OMP_NUM_THREADS'] = '1'
-        os.environ['MKL_NUM_THREADS'] = '1'
-        os.environ['OPENBLAS_NUM_THREADS'] = '1'
-        os.environ['NUMEXPR_NUM_THREADS'] = '1'
-        
-        # Also limit PyTorch threads
-        torch.set_num_threads(1)
-        print(f"Limited each worker to 1 threads (total cores used: ~{num_workers})")
-        
-        # Convert DataFrame to dict for pickling (Windows multiprocessing issue)
-        t_len = len(t)
-        
-        # Prepare arguments for each day
-        # MATLAB: for iday = sst:ssfin+1 where sst=670, ssfin=height(t)=len(t)
-        # If len(t)=1000, MATLAB processes days 670 to 1001 (inclusive)
-        # Python: range(sst, ssfin + 1 + 1) = range(670, 1002) gives 670-1001
-        print(f"DEBUG: Creating args_list for range({sst}, {ssfin + 1 + 1}) = days {sst} to {ssfin+1}", flush=True)
-        args_list = []
-        for idx, iday in enumerate(range(sst, ssfin + 1 + 1)):
-            # WINDOWS FIX: Always use GPU 0 for all workers
-            # DataParallel will handle multi-GPU distribution within train_lstm_model
-            gpu_id = 0  # Always use primary GPU (cuda:0)
-
-            args_list.append((
-                iday, fname, ain, dout, finf - 1, t_len, hash2, r, snfai, ssfin, sst, device, gpu_id
-            ))
-        
-        print(f"Processing {len(args_list)} days in parallel...")
-        print("Note: Press Ctrl+C to stop (may take a moment to respond)\n")
-        
-        # Test pickling (Windows multiprocessing requirement)
-        pickle_success = True
-        try:
-            import pickle
-            print("Testing data serialization for multiprocessing...", flush=True)
-            test_args = args_list[0]
-            pickle.dumps(test_args)
-            print("Serialization test passed!", flush=True)
-        except Exception as e:
-            print(f"ERROR: Cannot serialize data for multiprocessing: {e}")
-            print("This is a Windows multiprocessing issue. Falling back to sequential processing...")
-            pickle_success = False
-        
-        if pickle_success:  # Only use parallel if pickle test passed
-            global _global_pool, _worker_pids  # Declare globals at start of scope
-            
-            pool = None
-            completed = 0
-            interrupted = False
-            results_dict = {}  # Store results as they come in
-            
-            try:
-                print("Creating process pool...", flush=True)
-                pool = Pool(num_workers)
-                _global_pool = pool  # Store in module-level global for atexit cleanup
+        if use_parallel:
+            # Parallel processing
+            # GPU parallel processing: distribute workers across all GPUs
+            if device == 'cuda':
+                # Multi-GPU support
+                num_gpus = torch.cuda.device_count()
                 
-                # Track worker PIDs for aggressive cleanup
-                _worker_pids = [p.pid for p in pool._pool] if hasattr(pool, '_pool') and pool._pool else []
-                print(f"Process pool created successfully! Tracking {len(_worker_pids)} worker PIDs", flush=True)
-                
-                # Submit all tasks and get AsyncResult objects
-                print("Submitting parallel tasks...", flush=True)
-                total_tasks = len(args_list)
-                async_results = []
-                
-                for args in args_list:
-                    async_result = pool.apply_async(process_single_day, (args,))
-                    async_results.append((args[0], async_result))  # (day_index, AsyncResult)
-                
-                print(f"Submitted {total_tasks} tasks to {num_workers} workers", flush=True)
-                
-                # Close pool to prevent new tasks
-                pool.close()
-                
-                # Wait for results with timeout and progress tracking
-                print(f"\nProcessing {total_tasks} days...")
-                print("Progress updates every 10 seconds...", flush=True)
-                
-                timeout_per_task = 300  # 5 minutes max per task
-                global_timeout = 1800  # 15 minutes total (reduced monitoring overhead)
-                start_time = time.time()
-                last_progress_time = start_time
-                progress_interval = 20  # Show progress every 20 seconds (reduced overhead)
-                
-                stuck_check_interval = 30  # Check for stuck tasks every 30 seconds
-                last_stuck_check = start_time
-                
-                while completed < total_tasks:
-                    current_time = time.time()
-                    elapsed = current_time - start_time
-                    
-                    # Check global timeout
-                    if elapsed > global_timeout:
-                        print(f"\n{'='*70}")
-                        print(f"GLOBAL TIMEOUT: {elapsed:.0f}s exceeded limit of {global_timeout:.0f}s")
-                        print(f"Completed: {completed}/{total_tasks} tasks")
-                        print("Terminating all workers...")
-                        print(f"{'='*70}")
-                        pool.terminate()
-                        pool.join()
-                        break
-                    
-                    # Periodic progress update (reduced frequency for speed)
-                    if current_time - last_progress_time >= progress_interval:
-                        print(f"Progress: {completed}/{total_tasks} completed ({100*completed/total_tasks:.1f}%) - Elapsed: {elapsed:.0f}s", flush=True)
-                        last_progress_time = current_time
-                        progress_interval = 30  # Increase interval to 30s after first update
-                    
-                    # Check for stuck workers periodically
-                    if current_time - last_stuck_check >= stuck_check_interval:
-                        # Count how many tasks are still pending
-                        pending = sum(1 for _, ar in async_results if not ar.ready())
-                        if pending > 0 and completed > 0:  # Only show if we have some progress
-                            print(f"Status: {completed} done, {pending} pending, {total_tasks - completed - pending} waiting", flush=True)
-                        last_stuck_check = current_time
-                    
-                    # Try to collect completed results
-                    any_collected = False
-                    for day_idx, async_result in async_results:
-                        if day_idx in results_dict:
-                            continue  # Already collected
-                        
-                        if async_result.ready():
-                            try:
-                                result = async_result.get(timeout=1.0)
-                                day_idx, ht, h1 = result
-                                hasht[day_idx - 1, r] = ht
-                                hash1[day_idx - 1, r] = h1
-                                results_dict[day_idx] = True
-                                completed += 1
-                                any_collected = True
-                            except Exception as e:
-                                print(f"\nError collecting result for day {day_idx}: {e}", flush=True)
-                                results_dict[day_idx - 1] = True  # Mark as processed to avoid retry
-                                completed += 1
-                    
-                    # If nothing was collected this iteration, sleep briefly
-                    if not any_collected:
-                        time.sleep(0.05)  # Reduced sleep for faster polling
-                    
-                    # Check if any tasks have been running too long
-                    if current_time - start_time > timeout_per_task and completed == 0:
-                        print(f"\n{'='*70}")
-                        print(f"WARNING: No tasks completed after {timeout_per_task}s")
-                        print("This suggests workers are stuck. Terminating pool...")
-                        print(f"{'='*70}")
-                        pool.terminate()
-                        pool.join()
-                        print("Pool terminated. Consider using use_parallel = False")
-                        break
-                
-                # Wait for remaining workers to finish
-                print("\nWaiting for pool to close...", flush=True)
-                pool.close()
-                pool.join()  # Wait for all workers to finish (blocks until done)
-                
-                # Check if pool is still alive (workers didn't finish)
-                if pool._pool and any(p.is_alive() for p in pool._pool):
-                    print("\nWarning: Some workers are still alive.", flush=True)
-                    print("Forcefully terminating remaining workers...", flush=True)
-                    pool.terminate()
-                    pool.join()  # Clean up terminated workers
-                
-                if completed == total_tasks:
-                    print(f"\n✓ Successfully completed all {completed} days!")
+                if max_gpu_workers_override is not None:
+                    # Use manual override
+                    num_workers = max_gpu_workers_override
+                    print(f"\n{num_gpus} GPU(s) detected")
+                    print(f"Using {num_workers} parallel workers (MANUAL OVERRIDE)")
                 else:
-                    print(f"\n⚠ Completed {completed}/{total_tasks} days ({100*completed/total_tasks:.1f}%)")
-                    print(f"  {total_tasks - completed} tasks did not complete")
+                    # Automatic calculation based on total GPU memory across all GPUs
+                    total_gpu_memory = sum(
+                        torch.cuda.get_device_properties(i).total_memory / (1024**3)
+                        for i in range(num_gpus)
+                    )
+                    
+                    # Each worker needs ~1-2GB, distribute across all GPUs
+                    max_workers_per_gpu = 16  # NUCLEAR: 16 workers per GPU for absolute maximum speed
+                    max_gpu_workers = num_gpus * max_workers_per_gpu
+                    num_workers = min(cpu_count(), max_gpu_workers, 16)  # Cap at 128 total for max throughput
+                    
+                    print(f"\n{num_gpus} GPU(s) detected (Total memory: {total_gpu_memory:.1f} GB)")
+                    print(f"Using {num_workers} parallel workers")
                 
-            except KeyboardInterrupt:
-                interrupted = True
-                print("\n\n" + "="*70)
-                print("KEYBOARD INTERRUPT DETECTED!")
-                print("="*70)
-                print(f"Processed {completed} out of {total_tasks} days")
-                if pool is not None:
-                    print("Terminating worker processes (please wait)...")
-                    pool.terminate()
-                    pool.join()  # Wait for termination (no timeout parameter)
-                    print("Workers terminated.")
-                print("Saving partial results...")
+                print(f"Note: All workers use GPU 0 as primary (Windows compatibility)")
+                print(f"      DataParallel distributes training across all {num_gpus} GPU(s) within each worker")
+                print(f"      Set max_gpu_workers_override if you get OOM errors")
+            else:
+                # CPU parallel processing: can use more workers
+                num_workers = min(cpu_count(), max_workers)
+                print(f"Using {num_workers} parallel workers (CPU cores available: {cpu_count()})")
+                print("Using CPU for parallel processing")
             
+            # Set environment variables to limit thread usage per worker
+            os.environ['OMP_NUM_THREADS'] = '1'
+            os.environ['MKL_NUM_THREADS'] = '1'
+            os.environ['OPENBLAS_NUM_THREADS'] = '1'
+            os.environ['NUMEXPR_NUM_THREADS'] = '1'
+            
+            # Also limit PyTorch threads
+            torch.set_num_threads(1)
+            print(f"Limited each worker to 1 threads (total cores used: ~{num_workers})")
+            
+            # Convert DataFrame to dict for pickling (Windows multiprocessing issue)
+            t_len = len(t)
+            
+            # Prepare arguments for each day
+            # MATLAB: for iday = sst:ssfin+1 where sst=670, ssfin=height(t)=len(t)
+            # If len(t)=1000, MATLAB processes days 670 to 1001 (inclusive)
+            # Python: range(sst, ssfin + 1 + 1) = range(670, 1002) gives 670-1001
+            print(f"DEBUG: Creating args_list for range({sst}, {ssfin + 1 + 1}) = days {sst} to {ssfin+1}", flush=True)
+            args_list = []
+            for idx, iday in enumerate(range(sst, ssfin + 1 + 1)):
+                # WINDOWS FIX: Always use GPU 0 for all workers
+                # DataParallel will handle multi-GPU distribution within train_lstm_model
+                gpu_id = 0  # Always use primary GPU (cuda:0)
+    
+                args_list.append((
+                    iday, fname, ain, dout, finf - 1, t_len, hash2, r, snfai, ssfin, sst, device, gpu_id
+                ))
+            
+            print(f"Processing {len(args_list)} days in parallel...")
+            print("Note: Press Ctrl+C to stop (may take a moment to respond)\n")
+            
+            # Test pickling (Windows multiprocessing requirement)
+            pickle_success = True
+            try:
+                import pickle
+                print("Testing data serialization for multiprocessing...", flush=True)
+                test_args = args_list[0]
+                pickle.dumps(test_args)
+                print("Serialization test passed!", flush=True)
             except Exception as e:
-                import traceback
-                print(f"\n\n{'='*70}")
-                print("FATAL ERROR during parallel processing:")
-                print(f"{'='*70}")
-                print(f"Exception type: {type(e).__name__}")
-                print(f"Exception message: {str(e)}")
-                print(f"\nCompleted {completed} out of {total_tasks} days before error")
-                print("\nFull traceback:")
-                traceback.print_exc()
-                print(f"{'='*70}")
-                if pool is not None:
-                    print("Forcefully terminating all workers...")
-                    pool.terminate()
-                    pool.join()  # Wait for termination (no timeout parameter)
-                    print("Workers terminated.")
-                print("\nSuggestion: Try setting use_parallel = False in the code")
-                print("for sequential processing, which is more reliable on Windows.")
-                print(f"{'='*70}")
-                print("Saving partial results...")
+                print(f"ERROR: Cannot serialize data for multiprocessing: {e}")
+                print("This is a Windows multiprocessing issue. Falling back to sequential processing...")
+                pickle_success = False
             
-            finally:
-                # Ensure pool is always cleaned up
-                print("\nCleaning up worker pool...", flush=True)
-                if pool is not None:
-                    try:
-                        print("Terminating worker processes via pool...", flush=True)
+            if pickle_success:  # Only use parallel if pickle test passed
+                global _global_pool, _worker_pids  # Declare globals at start of scope
+                
+                pool = None
+                completed = 0
+                interrupted = False
+                results_dict = {}  # Store results as they come in
+                
+                try:
+                    print("Creating process pool...", flush=True)
+                    pool = Pool(num_workers)
+                    _global_pool = pool  # Store in module-level global for atexit cleanup
+                    
+                    # Track worker PIDs for aggressive cleanup
+                    _worker_pids = [p.pid for p in pool._pool] if hasattr(pool, '_pool') and pool._pool else []
+                    print(f"Process pool created successfully! Tracking {len(_worker_pids)} worker PIDs", flush=True)
+                    
+                    # Submit all tasks and get AsyncResult objects
+                    print("Submitting parallel tasks...", flush=True)
+                    total_tasks = len(args_list)
+                    async_results = []
+                    
+                    for args in args_list:
+                        async_result = pool.apply_async(process_single_day, (args,))
+                        async_results.append((args[0], async_result))  # (day_index, AsyncResult)
+                    
+                    print(f"Submitted {total_tasks} tasks to {num_workers} workers", flush=True)
+                    
+                    # Close pool to prevent new tasks
+                    pool.close()
+                    
+                    # Wait for results with timeout and progress tracking
+                    print(f"\nProcessing {total_tasks} days...")
+                    print("Progress updates every 10 seconds...", flush=True)
+                    
+                    timeout_per_task = 300  # 5 minutes max per task
+                    global_timeout = 1800  # 15 minutes total (reduced monitoring overhead)
+                    start_time = time.time()
+                    last_progress_time = start_time
+                    progress_interval = 20  # Show progress every 20 seconds (reduced overhead)
+                    
+                    stuck_check_interval = 30  # Check for stuck tasks every 30 seconds
+                    last_stuck_check = start_time
+                    
+                    while completed < total_tasks:
+                        current_time = time.time()
+                        elapsed = current_time - start_time
+                        
+                        # Check global timeout
+                        if elapsed > global_timeout:
+                            print(f"\n{'='*70}")
+                            print(f"GLOBAL TIMEOUT: {elapsed:.0f}s exceeded limit of {global_timeout:.0f}s")
+                            print(f"Completed: {completed}/{total_tasks} tasks")
+                            print("Terminating all workers...")
+                            print(f"{'='*70}")
+                            pool.terminate()
+                            pool.join()
+                            break
+                        
+                        # Periodic progress update (reduced frequency for speed)
+                        if current_time - last_progress_time >= progress_interval:
+                            print(f"Progress: {completed}/{total_tasks} completed ({100*completed/total_tasks:.1f}%) - Elapsed: {elapsed:.0f}s", flush=True)
+                            last_progress_time = current_time
+                            progress_interval = 30  # Increase interval to 30s after first update
+                        
+                        # Check for stuck workers periodically
+                        if current_time - last_stuck_check >= stuck_check_interval:
+                            # Count how many tasks are still pending
+                            pending = sum(1 for _, ar in async_results if not ar.ready())
+                            if pending > 0 and completed > 0:  # Only show if we have some progress
+                                print(f"Status: {completed} done, {pending} pending, {total_tasks - completed - pending} waiting", flush=True)
+                            last_stuck_check = current_time
+                        
+                        # Try to collect completed results
+                        any_collected = False
+                        for day_idx, async_result in async_results:
+                            if day_idx in results_dict:
+                                continue  # Already collected
+                            
+                            if async_result.ready():
+                                try:
+                                    result = async_result.get(timeout=1.0)
+                                    day_idx, ht, h1 = result
+                                    hasht[day_idx - 1, r] = ht
+                                    hash1[day_idx - 1, r] = h1
+                                    results_dict[day_idx] = True
+                                    completed += 1
+                                    any_collected = True
+                                except Exception as e:
+                                    print(f"\nError collecting result for day {day_idx}: {e}", flush=True)
+                                    results_dict[day_idx - 1] = True  # Mark as processed to avoid retry
+                                    completed += 1
+                        
+                        # If nothing was collected this iteration, sleep briefly
+                        if not any_collected:
+                            time.sleep(0.05)  # Reduced sleep for faster polling
+                        
+                        # Check if any tasks have been running too long
+                        if current_time - start_time > timeout_per_task and completed == 0:
+                            print(f"\n{'='*70}")
+                            print(f"WARNING: No tasks completed after {timeout_per_task}s")
+                            print("This suggests workers are stuck. Terminating pool...")
+                            print(f"{'='*70}")
+                            pool.terminate()
+                            pool.join()
+                            print("Pool terminated. Consider using use_parallel = False")
+                            break
+                    
+                    # Wait for remaining workers to finish
+                    print("\nWaiting for pool to close...", flush=True)
+                    pool.close()
+                    pool.join()  # Wait for all workers to finish (blocks until done)
+                    
+                    # Check if pool is still alive (workers didn't finish)
+                    if pool._pool and any(p.is_alive() for p in pool._pool):
+                        print("\nWarning: Some workers are still alive.", flush=True)
+                        print("Forcefully terminating remaining workers...", flush=True)
+                        pool.terminate()
+                        pool.join()  # Clean up terminated workers
+                    
+                    if completed == total_tasks:
+                        print(f"\n✓ Successfully completed all {completed} days!")
+                    else:
+                        print(f"\n⚠ Completed {completed}/{total_tasks} days ({100*completed/total_tasks:.1f}%)")
+                        print(f"  {total_tasks - completed} tasks did not complete")
+                    
+                except KeyboardInterrupt:
+                    interrupted = True
+                    print("\n\n" + "="*70)
+                    print("KEYBOARD INTERRUPT DETECTED!")
+                    print("="*70)
+                    print(f"Processed {completed} out of {total_tasks} days")
+                    if pool is not None:
+                        print("Terminating worker processes (please wait)...")
                         pool.terminate()
                         pool.join()  # Wait for termination (no timeout parameter)
-                        print("Pool terminated.", flush=True)
-                        
-                        # Aggressive cleanup: Check if any workers are still alive
-                        alive_workers = []
-                        if hasattr(pool, '_pool') and pool._pool:
-                            alive_workers = [p for p in pool._pool if p.is_alive()]
-                        
-                        if alive_workers:
-                            print(f"Warning: {len(alive_workers)} workers still alive after terminate()", flush=True)
-                            print("Forcefully killing remaining workers by PID...", flush=True)
-                            for p in alive_workers:
-                                try:
-                                    kill_process_tree(p.pid)
-                                except:
-                                    pass
-                            print("Forced kill complete.", flush=True)
-                        
-                        # Additional safety: Kill by tracked PIDs
-                        if _worker_pids:
-                            remaining = 0
-                            for pid in _worker_pids:
-                                try:
-                                    if psutil.pid_exists(pid):
+                        print("Workers terminated.")
+                    print("Saving partial results...")
+                
+                except Exception as e:
+                    import traceback
+                    print(f"\n\n{'='*70}")
+                    print("FATAL ERROR during parallel processing:")
+                    print(f"{'='*70}")
+                    print(f"Exception type: {type(e).__name__}")
+                    print(f"Exception message: {str(e)}")
+                    print(f"\nCompleted {completed} out of {total_tasks} days before error")
+                    print("\nFull traceback:")
+                    traceback.print_exc()
+                    print(f"{'='*70}")
+                    if pool is not None:
+                        print("Forcefully terminating all workers...")
+                        pool.terminate()
+                        pool.join()  # Wait for termination (no timeout parameter)
+                        print("Workers terminated.")
+                    print("\nSuggestion: Try setting use_parallel = False in the code")
+                    print("for sequential processing, which is more reliable on Windows.")
+                    print(f"{'='*70}")
+                    print("Saving partial results...")
+                
+                finally:
+                    # Ensure pool is always cleaned up
+                    print("\nCleaning up worker pool...", flush=True)
+                    if pool is not None:
+                        try:
+                            print("Terminating worker processes via pool...", flush=True)
+                            pool.terminate()
+                            pool.join()  # Wait for termination (no timeout parameter)
+                            print("Pool terminated.", flush=True)
+                            
+                            # Aggressive cleanup: Check if any workers are still alive
+                            alive_workers = []
+                            if hasattr(pool, '_pool') and pool._pool:
+                                alive_workers = [p for p in pool._pool if p.is_alive()]
+                            
+                            if alive_workers:
+                                print(f"Warning: {len(alive_workers)} workers still alive after terminate()", flush=True)
+                                print("Forcefully killing remaining workers by PID...", flush=True)
+                                for p in alive_workers:
+                                    try:
+                                        kill_process_tree(p.pid)
+                                    except:
+                                        pass
+                                print("Forced kill complete.", flush=True)
+                            
+                            # Additional safety: Kill by tracked PIDs
+                            if _worker_pids:
+                                remaining = 0
+                                for pid in _worker_pids:
+                                    try:
+                                        if psutil.pid_exists(pid):
+                                            kill_process_tree(pid)
+                                            remaining += 1
+                                    except:
+                                        pass
+                                if remaining > 0:
+                                    print(f"Killed {remaining} processes by tracked PID.", flush=True)
+                            
+                            print("All workers terminated successfully.", flush=True)
+                            
+                        except Exception as cleanup_error:
+                            print(f"Warning during cleanup: {cleanup_error}", flush=True)
+                            # Even if cleanup fails, try to kill by PID
+                            if _worker_pids:
+                                print("Attempting PID-based cleanup...", flush=True)
+                                for pid in _worker_pids:
+                                    try:
                                         kill_process_tree(pid)
-                                        remaining += 1
-                                except:
-                                    pass
-                            if remaining > 0:
-                                print(f"Killed {remaining} processes by tracked PID.", flush=True)
-                        
-                        print("All workers terminated successfully.", flush=True)
-                        
-                    except Exception as cleanup_error:
-                        print(f"Warning during cleanup: {cleanup_error}", flush=True)
-                        # Even if cleanup fails, try to kill by PID
-                        if _worker_pids:
-                            print("Attempting PID-based cleanup...", flush=True)
-                            for pid in _worker_pids:
-                                try:
-                                    kill_process_tree(pid)
-                                except:
-                                    pass
-                    finally:
-                        # Clear both local and global references
-                        _global_pool = None
-                        pool = None
-                        _worker_pids.clear()
+                                    except:
+                                        pass
+                        finally:
+                            # Clear both local and global references
+                            _global_pool = None
+                            pool = None
+                            _worker_pids.clear()
+            else:
+                # Pickle failed - fallback to sequential processing
+                print("\nFalling back to sequential processing...")
+                t_len = len(t)
+                try:
+                    # MATLAB: for iday = sst:ssfin+1 where ssfin=height(t)=len(t)
+                    # Python: range(sst, ssfin + 1 + 1) = range(670, 1002) gives 670-1001
+                    for iday in range(sst, ssfin + 1 + 1):
+                        gpu_id = 0  # Sequential mode uses first GPU only
+                        k, ht, h1 = optoai(
+                            iday, fname, ain, dout, finf - 1, t_len, hash2, r, snfai, ssfin, sst, device, gpu_id
+                        )
+                        hasht[k - 1, r] = ht
+                        hash1[k - 1, r] = h1
+                except KeyboardInterrupt:
+                    print("\n\nKeyboard interrupt detected! Stopping...")
+                    print("Saving partial results...")
         else:
-            # Pickle failed - fallback to sequential processing
-            print("\nFalling back to sequential processing...")
-            t_len = len(t)
+            # Sequential processing (easier for debugging)
+            print("\n" + "="*70)
+            print("RUNNING SEQUENTIAL PROCESSING")
+            print("="*70)
+            print(f"Processing days {sst} to {ssfin} sequentially...")
+            print(f"Total days to process: {ssfin - sst}")
+            print(f"Device: {device}")
+            print(f"Hyperparameter row: r={r+1}")
+            print(f"Target asset (finf): {finf}")
+            print()
+            
             try:
+                t_len = len(t)
+                processed_count = 0
                 # MATLAB: for iday = sst:ssfin+1 where ssfin=height(t)=len(t)
                 # Python: range(sst, ssfin + 1 + 1) = range(670, 1002) gives 670-1001
                 for iday in range(sst, ssfin + 1 + 1):
@@ -1056,40 +1074,13 @@ def main():
                     k, ht, h1 = optoai(
                         iday, fname, ain, dout, finf - 1, t_len, hash2, r, snfai, ssfin, sst, device, gpu_id
                     )
-                    hasht[k - 1, r] = ht
-                    hash1[k - 1, r] = h1
+                    hasht[k - 1, r] = ht  # FIX: Use k-1 to match parallel mode
+                    hash1[k - 1, r] = h1  # FIX: Use k-1 to match parallel mode
+                    processed_count += 1
             except KeyboardInterrupt:
                 print("\n\nKeyboard interrupt detected! Stopping...")
                 print("Saving partial results...")
-    else:
-        # Sequential processing (easier for debugging)
-        print("\n" + "="*70)
-        print("RUNNING SEQUENTIAL PROCESSING")
-        print("="*70)
-        print(f"Processing days {sst} to {ssfin} sequentially...")
-        print(f"Total days to process: {ssfin - sst}")
-        print(f"Device: {device}")
-        print(f"Hyperparameter row: r={r+1}")
-        print(f"Target asset (finf): {finf}")
-        print()
         
-        try:
-            t_len = len(t)
-            processed_count = 0
-            # MATLAB: for iday = sst:ssfin+1 where ssfin=height(t)=len(t)
-            # Python: range(sst, ssfin + 1 + 1) = range(670, 1002) gives 670-1001
-            for iday in range(sst, ssfin + 1 + 1):
-                gpu_id = 0  # Sequential mode uses first GPU only
-                k, ht, h1 = optoai(
-                    iday, fname, ain, dout, finf - 1, t_len, hash2, r, snfai, ssfin, sst, device, gpu_id
-                )
-                hasht[k - 1, r] = ht  # FIX: Use k-1 to match parallel mode
-                hash1[k - 1, r] = h1  # FIX: Use k-1 to match parallel mode
-                processed_count += 1
-        except KeyboardInterrupt:
-            print("\n\nKeyboard interrupt detected! Stopping...")
-            print("Saving partial results...")
-    
     # Save results
     print("\nSaving results...")
 
@@ -1097,14 +1088,21 @@ def main():
     non_zero_count = np.count_nonzero(hasht)
     print(f"Debug: Total non-zero predictions: {non_zero_count}")
     print(f"Debug: Result matrix shape: {hasht.shape}")
-    print(f"Debug: Using hyperparameter column r={r+1}")
-    print(f"Debug: Non-zero in column {r+1}: {np.count_nonzero(hasht[:, r])}")
     
-    # Debug: Check value types in hasht (should be discrete: 0, 1, 2, 3)
-    unique_values = np.unique(hasht[:, r])
-    print(f"Debug: Unique values in hasht column {r}: {unique_values}")
-    print(f"Debug: hasht data type: {hasht.dtype}")
+    # Debug: Check which columns have non-zero values
+    non_zero_cols = [i for i in range(hasht.shape[1]) if np.count_nonzero(hasht[:, i]) > 0]
+    print(f"Debug: Columns with non-zero values: {len(non_zero_cols)} out of {hasht.shape[1]}")
+    if len(non_zero_cols) > 0:
+        print(f"Debug: First few non-zero columns: {non_zero_cols[:10]}")
     
+    # Debug: Sample some values from row 670
+    if hasht.shape[0] > 670:
+        # Show first 10 non-zero values in row 670
+        row_670_nonzero = np.nonzero(hasht[669, :])[0]
+        if len(row_670_nonzero) > 0:
+            print(f"Debug: Row 670 non-zero columns: {row_670_nonzero[:10]}")
+            print(f"Debug: Row 670 non-zero values: {hasht[669, row_670_nonzero[:10]]}")
+
     # IMPORTANT: Only save first len(t)+1 rows to match MATLAB output
     # MATLAB uses 1-based indexing so hasht has rows 1 to height(t)+1 = 1 to 1003
     # Python stores days using day numbers as indices, so we have indices 0-1003 (1004 rows)
