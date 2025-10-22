@@ -25,9 +25,9 @@
 # Feature Engineering:
 #   Total: 104 features per time step
 #   - Features 1-26:   Current close prices from 26 markets
-#   - Features 27-52:  1-day slope (current - previous day)
-#   - Features 53-78:  2-day slope (current - avg of last 2 days)
-#   - Features 79-104: 3-day slope (current - avg of last 3 days)
+#   - Features 27-52:  1-day slope (current - previous day) with shorts multiplier
+#   - Features 53-78:  2-day slope (current - 2 days ago) with shorts multiplier
+#   - Features 79-104: 3-day slope (current - avg of last 3 days) with shorts multiplier
 #
 # Data Organization:
 #   - Training:   27 sequences of 20 time steps each
@@ -41,7 +41,7 @@ import pandas as pd
 
 def loaddata228(snfai, k, t, ifile):
     nMin = len(t)
-    inputSize = 104
+    inputSize = 104  # MATLAB uses 104 features: 26 prices + 26 slopes + 52 deltas
     ain = np.zeros((nMin, inputSize), dtype=np.float64)
 
     # DEBUG: Check bounds for this day
@@ -84,19 +84,25 @@ def loaddata228(snfai, k, t, ifile):
         k1, k2, k3 = 26, 52, 78
         for ii in range(26):
             temp1 = snfai[i, 3, ii] - snfai[i - 1, 3, ii]
-
             shorts = 3.0
-            ain[i, k1 + ii] = temp1 * shorts if temp1 < 0 else temp1
+            if temp1 < 0:
+                ain[i, k1 + ii] = temp1 * shorts
+            else:
+                ain[i, k1 + ii] = temp1
 
             # i-2
-            temp1 = ((snfai[i, 3, ii] + snfai[i - 1, 3, ii]) / 2) - snfai[i - 2, 3, ii]
-            temp1 = snfai[i, 3, ii] + (snfai[i - 2, 3, ii] + snfai[i - 1, 3, ii]) / 2
-
-            ain[i, k2 + ii] = temp1 * shorts if temp1 < 0 else temp1
+            temp1 = snfai[i, 3, ii] - snfai[i - 2, 3, ii]
+            if temp1 < 0:
+                ain[i, k2 + ii] = temp1 * shorts
+            else:
+                ain[i, k2 + ii] = temp1
 
             # i-3
             temp1 = snfai[i, 3, ii] - (snfai[i - 3, 3, ii] + snfai[i - 2, 3, ii] + snfai[i - 1, 3, ii]) / 3
-            ain[i, k3 + ii] = temp1 * shorts if temp1 < 0 else temp1
+            if temp1 < 0:
+                ain[i, k3 + ii] = temp1 * shorts
+            else:
+                ain[i, k3 + ii] = temp1
 
     # --- Build output vectors ---
     aout = np.zeros((nMin, 1), dtype=np.float64)

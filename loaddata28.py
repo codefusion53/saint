@@ -110,7 +110,7 @@ def loaddata28(fname: str, ifile1a: int = 0) -> Tuple[np.ndarray, np.ndarray, pd
     # Initialize input feature matrix
     # Total features: 26 (prices) + 26 (slopes) + 52 (deltas) = 104
     num_days = snfai.shape[0]
-    ain = np.zeros((num_days, 78), dtype=np.float64)  # Base features (will be expanded to 104)
+    ain = np.zeros((num_days, 78), dtype=np.float64)  # Total features: 104
 
     # MATLAB: for i=3:height(t) means i starts at 3 (1-based)
     # Python equivalent: range(2, num_days) means i starts at 2 (0-based, which is row 3 in 1-based)
@@ -168,6 +168,31 @@ def loaddata28(fname: str, ifile1a: int = 0) -> Tuple[np.ndarray, np.ndarray, pd
             current_normalized = snfai[i, 3, ii] - min_price
             previous_normalized = snfai[i - 1, 3, ii] - min_price
             ain[i, k1 + ii] = current_normalized - previous_normalized
+
+        # ====================================================================
+        # Feature Set 3: Delta Features (k2 = 52-77, k3 = 78-103)
+        # Calculate additional price change features
+        # MATLAB: k2=52, k3=78 for additional delta calculations
+        # Python: k2=52, k3=78 for additional delta calculations
+        # ====================================================================
+        k2 = 52
+        k3 = 78
+
+        for ii in range(26):
+            # Delta 1: 2-day change
+            temp1 = snfai[i, 3, ii] - snfai[i - 1, 3, ii]
+            shorts = 3.0
+            if temp1 < 0:
+                ain[i, k2 + ii] = temp1 * shorts
+            else:
+                ain[i, k2 + ii] = temp1
+
+            # Delta 2: 3-day change  
+            temp1 = snfai[i, 3, ii] - snfai[i - 2, 3, ii]
+            if temp1 < 0:
+                ain[i, k3 + ii] = temp1 * shorts
+            else:
+                ain[i, k3 + ii] = temp1
 
     # ========================================================================
     # Create Output Labels for Classification

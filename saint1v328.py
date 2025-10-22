@@ -232,7 +232,7 @@ def optoai(
     
     # Create model (BEFORE setting final seed)
     model = LSTMClassifier(
-        input_size=104,
+        input_size=104,  # MATLAB uses 104 features consistently
         sequence_length=sequence_length,
         hidden_size=hidden_size,
         dropout_rate=dropout_rate,
