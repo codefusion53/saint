@@ -78,11 +78,11 @@ def loaddata28(fname: str, ifile1a: int = 0) -> Tuple[np.ndarray, np.ndarray, pd
         if ifile == 0:
             first_sheet_rows = len(df)
             # Initialize 3D array based on first sheet's size (MATLAB behavior)
-            snfai = np.zeros((first_sheet_rows, 19, len(sheet_names)), dtype=np.float64)
+            snfai = np.zeros((first_sheet_rows, 19, len(sheet_names)), dtype=np.float16)
 
         # Initialize storage array
         num_days = len(df)
-        sn = np.zeros((num_days, 19), dtype=np.float64)
+        sn = np.zeros((num_days, 19), dtype=np.float16)
 
         # Extract OHLC data
         # Assuming columns: [Date, Open, Close, High, Low, ...]
@@ -110,7 +110,7 @@ def loaddata28(fname: str, ifile1a: int = 0) -> Tuple[np.ndarray, np.ndarray, pd
     # Initialize input feature matrix
     # Total features: 26 (prices) + 26 (slopes) + 52 (deltas) = 104
     num_days = snfai.shape[0]
-    ain = np.zeros((num_days, 78), dtype=np.float64)  # Total features: 104
+    ain = np.zeros((num_days, 104), dtype=np.float16)  # Total features: 104
 
     # MATLAB: for i=3:height(t) means i starts at 3 (1-based)
     # Python equivalent: range(2, num_days) means i starts at 2 (0-based, which is row 3 in 1-based)
@@ -164,10 +164,11 @@ def loaddata28(fname: str, ifile1a: int = 0) -> Tuple[np.ndarray, np.ndarray, pd
         for ii in range(26):
             # MATLAB: ain(i,k1+ii)=(snfai(i,4,ii)-min(snfai(range,4,ii)))-(snfai(i-1,4,ii)-min(snfai(range,4,ii)))
             # Slope = change in normalized price from day i-1 to day i
-            min_price = np.min(snfai[range_slice, 3, ii])
-            current_normalized = snfai[i, 3, ii] - min_price
-            previous_normalized = snfai[i - 1, 3, ii] - min_price
-            ain[i, k1 + ii] = current_normalized - previous_normalized
+            # Use float32 for intermediate calculations to avoid overflow
+            min_price = np.min(snfai[range_slice, 3, ii].astype(np.float32)).astype(np.float16)
+            current_normalized = (snfai[i, 3, ii] - min_price).astype(np.float16)
+            previous_normalized = (snfai[i - 1, 3, ii] - min_price).astype(np.float16)
+            ain[i, k1 + ii] = (current_normalized - previous_normalized).astype(np.float16)
 
         # ====================================================================
         # Feature Set 3: Delta Features (k2 = 52-77, k3 = 78-103)
@@ -179,27 +180,27 @@ def loaddata28(fname: str, ifile1a: int = 0) -> Tuple[np.ndarray, np.ndarray, pd
         k3 = 78
 
         for ii in range(26):
-            # Delta 1: 2-day change
-            temp1 = snfai[i, 3, ii] - snfai[i - 1, 3, ii]
+            # Delta 1: 2-day change (use float32 for intermediate calculations)
+            temp1 = (snfai[i, 3, ii] - snfai[i - 1, 3, ii]).astype(np.float32)
             shorts = 3.0
             if temp1 < 0:
-                ain[i, k2 + ii] = temp1 * shorts
+                ain[i, k2 + ii] = (temp1 * shorts).astype(np.float16)
             else:
-                ain[i, k2 + ii] = temp1
+                ain[i, k2 + ii] = temp1.astype(np.float16)
 
-            # Delta 2: 3-day change  
-            temp1 = snfai[i, 3, ii] - snfai[i - 2, 3, ii]
+            # Delta 2: 3-day change (use float32 for intermediate calculations)
+            temp1 = (snfai[i, 3, ii] - snfai[i - 2, 3, ii]).astype(np.float32)
             if temp1 < 0:
-                ain[i, k3 + ii] = temp1 * shorts
+                ain[i, k3 + ii] = (temp1 * shorts).astype(np.float16)
             else:
-                ain[i, k3 + ii] = temp1
+                ain[i, k3 + ii] = temp1.astype(np.float16)
 
     # ========================================================================
     # Create Output Labels for Classification
     # ========================================================================
     
     # Initialize output arrays
-    aout = np.zeros((num_days, 1), dtype=np.float64)
+    aout = np.zeros((num_days, 1), dtype=np.float16)
     dout = []
 
     # MATLAB: ifile1a=1 (1-based index), so in Python this is index 0

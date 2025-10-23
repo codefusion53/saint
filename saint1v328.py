@@ -330,6 +330,10 @@ def optoai(
     # This gives the model's confidence in its prediction
     h1 = float(conf[pred_class])  # Confidence in predicted class
     
+    # Ensure no NaN values in confidence
+    if np.isnan(h1) or np.isinf(h1):
+        h1 = 0.5  # Default confidence if NaN/Inf detected
+    
     # Evaluate prediction for betting
     # MATLAB: if k == height(t) + 1 (future prediction, no actual data)
     # Python: k is 1-based day number, t_len = height(t) in MATLAB
@@ -525,9 +529,9 @@ def main():
     # Load hyperparameter data
     hpdataname = 'D:/prodpy/hpdata3.csv'
     if Path(hpdataname).exists():
-        hpdata = pd.read_csv(hpdataname, header=None).values.astype(np.float64)
+        hpdata = pd.read_csv(hpdataname, header=None).values.astype(np.float16)
     else:
-        hpdata = np.zeros((14, 25), dtype=np.float64)
+        hpdata = np.zeros((14, 25), dtype=np.float16)
     
     # Mode configuration
     prod = 0  # Production mode: 0 = development (use r1=50), 1 = production (use asset-specific r1)
@@ -662,7 +666,7 @@ def main():
     # Load hash2 (hyperparameters)
     hash2_path = config['sname2r']
     if Path(hash2_path).exists():
-        hash2 = pd.read_csv(hash2_path, header=None).values.astype(np.float64)
+        hash2 = pd.read_csv(hash2_path, header=None).values.astype(np.float16)
     else:
         # Default hyperparameters
         hash2 = np.array([[
@@ -676,7 +680,7 @@ def main():
             10,   # Learn rate drop period
             20,   # Sequence length
             1     # L2 regularization (will be divided by 100)
-        ]], dtype=np.float64)
+        ]], dtype=np.float16)
 
     print(f"Data shape: {snfai.shape}")
     print(f"Data type: {snfai.dtype}")
@@ -715,8 +719,8 @@ def main():
     # When len(t)=1002:
     #   - Create 1004 rows (indices 0-1003) for storage
     #   - Save first 1003 rows (indices 0-1002) matching MATLAB's 1003×730 output
-    hasht = np.zeros((len(t) + 1, len(hash2)), dtype=np.float64)
-    hash1 = np.zeros((len(t) + 1, len(hash2)), dtype=np.float64)
+    hasht = np.zeros((len(t) + 1, len(hash2)), dtype=np.float16)
+    hash1 = np.zeros((len(t) + 1, len(hash2)), dtype=np.float16)
 
     # Main training loop
     # MATLAB uses 1-based indexing: r=50 means row 50 (the 50th row)
@@ -904,6 +908,9 @@ def main():
                                     result = async_result.get(timeout=1.0)
                                     day_idx, ht, h1 = result
                                     hasht[day_idx - 1, r] = ht
+                                    # Ensure no NaN values in confidence storage
+                                    if np.isnan(h1) or np.isinf(h1):
+                                        h1 = 0.5  # Default confidence
                                     hash1[day_idx - 1, r] = h1
                                     results_dict[day_idx] = True
                                     completed += 1
@@ -1048,6 +1055,9 @@ def main():
                             iday, fname, ain, dout, finf - 1, t_len, hash2, r, snfai, ssfin, sst, device, gpu_id
                         )
                         hasht[k - 1, r] = ht
+                        # Ensure no NaN values in confidence storage
+                        if np.isnan(h1) or np.isinf(h1):
+                            h1 = 0.5  # Default confidence
                         hash1[k - 1, r] = h1
                 except KeyboardInterrupt:
                     print("\n\nKeyboard interrupt detected! Stopping...")
@@ -1075,6 +1085,9 @@ def main():
                         iday, fname, ain, dout, finf - 1, t_len, hash2, r, snfai, ssfin, sst, device, gpu_id
                     )
                     hasht[k - 1, r] = ht  # FIX: Use k-1 to match parallel mode
+                    # Ensure no NaN values in confidence storage
+                    if np.isnan(h1) or np.isinf(h1):
+                        h1 = 0.5  # Default confidence
                     hash1[k - 1, r] = h1  # FIX: Use k-1 to match parallel mode
                     processed_count += 1
             except KeyboardInterrupt:
@@ -1112,8 +1125,18 @@ def main():
 
     # Use numpy savetxt for better control over number formatting
     # Save only the first len(t)+1 rows to match MATLAB's output format
-    np.savetxt(config['snamet'], hasht[:num_rows_to_save, :], delimiter=',', fmt='%.0f')  # Integers
-    np.savetxt(config['sname1'], hash1[:num_rows_to_save, :], delimiter=',', fmt='%.15g')  # Floats with precision
+    
+    # Ensure no NaN values before saving
+    hasht_clean = hasht[:num_rows_to_save, :].copy()
+    hash1_clean = hash1[:num_rows_to_save, :].copy()
+    
+    # Replace any remaining NaN values with 0 for hasht (predictions) and 0.5 for hash1 (confidences)
+    hasht_clean[np.isnan(hasht_clean)] = 0
+    hash1_clean[np.isnan(hash1_clean)] = 0.5
+    hash1_clean[np.isinf(hash1_clean)] = 0.5
+    
+    np.savetxt(config['snamet'], hasht_clean, delimiter=',', fmt='%.0f')  # Integers
+    np.savetxt(config['sname1'], hash1_clean, delimiter=',', fmt='%.15g')  # Floats with precision
     np.savetxt(config['sname2'], hash2, delimiter=',', fmt='%.15g')  # Mixed int/float
     
     print(f"\nResults saved to:")

@@ -42,7 +42,7 @@ import pandas as pd
 def loaddata228(snfai, k, t, ifile):
     nMin = len(t)
     inputSize = 104  # MATLAB uses 104 features: 26 prices + 26 slopes + 52 deltas
-    ain = np.zeros((nMin, inputSize), dtype=np.float64)
+    ain = np.zeros((nMin, inputSize), dtype=np.float16)
 
     # DEBUG: Check bounds for this day
     # if k > nMin - 50:  # Near the end of data
@@ -83,29 +83,30 @@ def loaddata228(snfai, k, t, ifile):
         # --- Slope and difference features ---
         k1, k2, k3 = 26, 52, 78
         for ii in range(26):
-            temp1 = snfai[i, 3, ii] - snfai[i - 1, 3, ii]
+            # Use float32 for intermediate calculations to avoid overflow
+            temp1 = (snfai[i, 3, ii] - snfai[i - 1, 3, ii]).astype(np.float32)
             shorts = 3.0
             if temp1 < 0:
-                ain[i, k1 + ii] = temp1 * shorts
+                ain[i, k1 + ii] = (temp1 * shorts).astype(np.float16)
             else:
-                ain[i, k1 + ii] = temp1
+                ain[i, k1 + ii] = temp1.astype(np.float16)
 
             # i-2
-            temp1 = snfai[i, 3, ii] - snfai[i - 2, 3, ii]
+            temp1 = (snfai[i, 3, ii] - snfai[i - 2, 3, ii]).astype(np.float32)
             if temp1 < 0:
-                ain[i, k2 + ii] = temp1 * shorts
+                ain[i, k2 + ii] = (temp1 * shorts).astype(np.float16)
             else:
-                ain[i, k2 + ii] = temp1
+                ain[i, k2 + ii] = temp1.astype(np.float16)
 
             # i-3
-            temp1 = snfai[i, 3, ii] - (snfai[i - 3, 3, ii] + snfai[i - 2, 3, ii] + snfai[i - 1, 3, ii]) / 3
+            temp1 = (snfai[i, 3, ii] - (snfai[i - 3, 3, ii] + snfai[i - 2, 3, ii] + snfai[i - 1, 3, ii]) / 3).astype(np.float32)
             if temp1 < 0:
-                ain[i, k3 + ii] = temp1 * shorts
+                ain[i, k3 + ii] = (temp1 * shorts).astype(np.float16)
             else:
-                ain[i, k3 + ii] = temp1
+                ain[i, k3 + ii] = temp1.astype(np.float16)
 
     # --- Build output vectors ---
-    aout = np.zeros((nMin, 1), dtype=np.float64)
+    aout = np.zeros((nMin, 1), dtype=np.float16)
     # MATLAB creates output with same size as input
     # Initialize with nMin elements
     cout = ["SHORT"] * (nMin - 1)
@@ -135,12 +136,18 @@ def loaddata228(snfai, k, t, ifile):
     # Cap the upper bound to nMin to prevent index out of bounds
     k_upper = min(k + 1, nMin)  # k+2 for inclusive end, but cap at nMin
 
-    muX = np.mean(ain[k - 580 - 1:k_upper, 0:inputSize], axis=0, dtype=np.float64)
-    sigmaX = np.std(ain[k - 580 - 1:k_upper, 0:inputSize], axis=0, ddof=1, dtype=np.float64)
+    # Calculate mean and std using float32 to avoid overflow, then convert to float16
+    muX = np.mean(ain[k - 580 - 1:k_upper, 0:inputSize], axis=0, dtype=np.float32).astype(np.float16)
+    sigmaX = np.std(ain[k - 580 - 1:k_upper, 0:inputSize], axis=0, ddof=1, dtype=np.float32).astype(np.float16)
 
+    # Add small epsilon to prevent division by zero
+    epsilon = np.finfo(np.float16).eps * 10  # Small value for numerical stability
+    
     for i in range(k - 580 - 1, k_upper):
         for j in range(inputSize):
-            ain[i, j] = (ain[i, j] - muX[j]) / sigmaX[j]
+            # Avoid division by zero by adding epsilon to denominator
+            sigma_safe = sigmaX[j] if abs(sigmaX[j]) > epsilon else epsilon
+            ain[i, j] = (ain[i, j] - muX[j]) / sigma_safe
 
     ain1 = ain.copy()
 
@@ -154,7 +161,7 @@ def loaddata228(snfai, k, t, ifile):
         # Ensure we don't go beyond array bounds
         if start_idx < 0 or end_idx > nMin:
             # If out of bounds, create a zero-filled sequence
-            temp = np.zeros((20, inputSize), dtype=np.float64)
+            temp = np.zeros((20, inputSize), dtype=np.float16)
             print(f"WARNING: Training input {i} out of bounds (k={k}, ic={ic}, start={start_idx}, end={end_idx}, nMin={nMin})", flush=True)
         else:
             temp = ain1[start_idx:end_idx, :]     # slice 20 rows, shape: (20, 104)
@@ -196,7 +203,7 @@ def loaddata228(snfai, k, t, ifile):
         start_idx = k - 19 - ic - 1
         end_idx = k - ic
         if start_idx < 0 or end_idx > nMin:
-            temp = np.zeros((20, inputSize), dtype=np.float64)
+            temp = np.zeros((20, inputSize), dtype=np.float16)
             print(f"WARNING: Validation input {i} out of bounds (k={k}, ic={ic}, start={start_idx}, end={end_idx}, nMin={nMin})", flush=True)
         else:
             temp = ain1[start_idx:end_idx, :]  # shape: (20, 104)
@@ -234,7 +241,7 @@ def loaddata228(snfai, k, t, ifile):
         start_idx = k - ic - 19 + 1 - 1
         end_idx = k - ic + 1
         if start_idx < 0 or end_idx > nMin:
-            tempi = np.zeros((20, inputSize), dtype=np.float64)
+            tempi = np.zeros((20, inputSize), dtype=np.float16)
             print(f"WARNING: Test input {i} out of bounds (k={k}, ic={ic}, start={start_idx}, end={end_idx}, nMin={nMin})", flush=True)
         else:
             tempi = ain1[start_idx:end_idx, :]  # shape: (20, 104)
