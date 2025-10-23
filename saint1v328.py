@@ -156,22 +156,22 @@ def optoai(
     torch.set_num_threads(1)  # Use 2 threads per worker for better CPU utilization
     
     # Initialize GPU in worker if requested (each worker gets its own CUDA context)
-    # WINDOWS FIX: Use cuda:0 for all workers to avoid device mismatch errors
-    # DataParallel will handle multi-GPU distribution within each worker
+    # Distribute workers across available GPUs for better utilization
     if device == 'cuda':
         try:
             # Re-initialize CUDA in this worker process
             torch.cuda.init()
             # Verify GPU is accessible
             if torch.cuda.is_available():
-                # WINDOWS: Always use cuda:0 (default GPU)
-                # DataParallel in train_lstm_model will distribute across all GPUs
                 num_gpus = torch.cuda.device_count()
-                torch.cuda.set_device(0)  # Always use GPU 0 as primary
-                device = 'cuda'  # Use 'cuda' instead of 'cuda:0' for compatibility
+                # Distribute workers across GPUs using modulo
+                # This ensures better load balancing across all 6 GPUs
+                assigned_gpu = gpu_id % num_gpus
+                torch.cuda.set_device(assigned_gpu)
+                device = f'cuda:{assigned_gpu}'
                 # Only print on first day to reduce output
                 if k % 50 == 0 or k == sst:
-                    print(f"Day {k}: Using GPU 0 as primary ({num_gpus} GPU(s) available via DataParallel)", flush=True)
+                    print(f"Day {k}: Using GPU {assigned_gpu} of {num_gpus} ({torch.cuda.get_device_name(assigned_gpu)})", flush=True)
             else:
                 # Fallback to CPU if GPU not available in worker
                 device = 'cpu'
@@ -216,6 +216,25 @@ def optoai(
     # Create datasets and data loaders (BEFORE setting seed for training)
     train_dataset = LSTMMarketDataset(anin, anout1)
     val_dataset = LSTMMarketDataset(avnin, avnout1)
+    
+    if len(avnin) > 0:
+        # Check for NaN/Inf in validation data
+        avnin_nan = any(np.isnan(seq).any() for seq in avnin)
+        avnout1_nan = any(np.isnan(seq).any() for seq in avnout1)
+        avnin_inf = any(np.isinf(seq).any() for seq in avnin)
+        avnout1_inf = any(np.isinf(seq).any() for seq in avnout1)
+        
+        # Fix NaN/Inf values in validation data
+        if avnin_nan or avnin_inf:
+            for i, seq in enumerate(avnin):
+                seq[np.isnan(seq)] = 0.0
+                seq[np.isinf(seq)] = 0.0
+                avnin[i] = seq
+        if avnout1_nan or avnout1_inf:
+            for i, seq in enumerate(avnout1):
+                seq[np.isnan(seq)] = 0
+                seq[np.isinf(seq)] = 0
+                avnout1[i] = seq
 
     train_loader = create_dataloader(
         train_dataset,
@@ -227,7 +246,8 @@ def optoai(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0
+        num_workers=0,
+        drop_last=False  # Don't drop small validation batches
     )
     
     # Create model (BEFORE setting final seed)
@@ -353,7 +373,6 @@ def optoai(
 
         # Safety check: ensure we're not accessing beyond snfai bounds
         if k - 1 >= snfai.shape[0]:
-            print(f"WARNING: k={k} exceeds snfai bounds (shape={snfai.shape}), treating as future prediction", flush=True)
             # Treat as future prediction since we don't have actual data
             if pred_class == 0:  # SHORT
                 ht = 2
@@ -457,6 +476,9 @@ def main():
     
     # Register signal handler for Ctrl+C
     signal.signal(signal.SIGINT, signal_handler)
+    
+    # Start overall timing
+    overall_start_time = time.time()
     
     print(LOGO)
     print("="*70)
@@ -771,8 +793,8 @@ def main():
                     print(f"\n{num_gpus} GPU(s) detected (Total memory: {total_gpu_memory:.1f} GB)")
                     print(f"Using {num_workers} parallel workers")
                 
-                print(f"Note: All workers use GPU 0 as primary (Windows compatibility)")
-                print(f"      DataParallel distributes training across all {num_gpus} GPU(s) within each worker")
+                print(f"Note: Workers distributed across all {num_gpus} GPU(s) for maximum utilization")
+                print(f"      Each worker uses one GPU, DataParallel distributes training within each worker")
                 print(f"      Set max_gpu_workers_override if you get OOM errors")
             else:
                 # CPU parallel processing: can use more workers
@@ -800,9 +822,9 @@ def main():
             print(f"DEBUG: Creating args_list for range({sst}, {ssfin + 1 + 1}) = days {sst} to {ssfin+1}", flush=True)
             args_list = []
             for idx, iday in enumerate(range(sst, ssfin + 1 + 1)):
-                # WINDOWS FIX: Always use GPU 0 for all workers
-                # DataParallel will handle multi-GPU distribution within train_lstm_model
-                gpu_id = 0  # Always use primary GPU (cuda:0)
+                # Distribute workers across all available GPUs for better utilization
+                # This ensures all 6 GPUs are used instead of just 5
+                gpu_id = idx % num_gpus  # Cycle through all available GPUs
     
                 args_list.append((
                     iday, fname, ain, dout, finf - 1, t_len, hash2, r, snfai, ssfin, sst, device, gpu_id
@@ -1144,8 +1166,24 @@ def main():
     print(f"  - {config['sname1']}")
     print(f"  - {config['sname2']}")
     
-    print(f"\nEnd time: {datetime.now()}")
-    print("="*70)
+    # Calculate and print overall elapsed time
+    overall_elapsed_time = time.time() - overall_start_time
+    hours = int(overall_elapsed_time // 3600)
+    minutes = int((overall_elapsed_time % 3600) // 60)
+    seconds = overall_elapsed_time % 60
+    
+    print(f"\n" + "="*70)
+    print(f"OVERALL EXECUTION COMPLETED")
+    print(f"="*70)
+    print(f"End time: {datetime.now()}")
+    print(f"Total elapsed time: {overall_elapsed_time:.2f} seconds")
+    if hours > 0:
+        print(f"Total elapsed time: {hours}h {minutes}m {seconds:.2f}s")
+    elif minutes > 0:
+        print(f"Total elapsed time: {minutes}m {seconds:.2f}s")
+    else:
+        print(f"Total elapsed time: {seconds:.2f}s")
+    print(f"="*70)
 
 
 if __name__ == '__main__':

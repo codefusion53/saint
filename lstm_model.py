@@ -140,9 +140,8 @@ class LSTMMarketDataset(Dataset):
         return len(self.sequences)
     
     def __getitem__(self, idx):
-        # Convert to tensors using float16 for storage, then float32 for model
-        # This provides memory efficiency while avoiding LSTM float16 issues
-        seq = torch.from_numpy(self.sequences[idx]).half().float()  # (features, time_steps)
+        # Convert to tensors using pure float16 for maximum memory efficiency
+        seq = torch.from_numpy(self.sequences[idx]).half()  # (features, time_steps)
         label = torch.from_numpy(self.labels[idx]).long().squeeze(0)  # (time_steps,)
         
         return seq, label
@@ -163,11 +162,11 @@ def init_weights_matlab_style(m):
     if isinstance(m, nn.LSTM):
         for name, param in m.named_parameters():
             if 'weight_ih' in name:
-                # Input-hidden weights: Glorot uniform (scaled for float16)
-                nn.init.xavier_uniform_(param.data, gain=0.5)  # Reduced gain for float16
+                # Input-hidden weights: Glorot uniform (optimized for pure float16)
+                nn.init.xavier_uniform_(param.data, gain=0.3)  # Further reduced for pure float16
             elif 'weight_hh' in name:
-                # Hidden-hidden weights: Orthogonal initialization (scaled for float16)
-                nn.init.orthogonal_(param.data, gain=0.5)  # Reduced gain for float16
+                # Hidden-hidden weights: Orthogonal initialization (optimized for pure float16)
+                nn.init.orthogonal_(param.data, gain=0.3)  # Further reduced for pure float16
             elif 'bias' in name:
                 # Biases: zeros
                 param.data.fill_(0.0)
@@ -176,22 +175,23 @@ def init_weights_matlab_style(m):
                 param.data[n//4:n//2].fill_(1.0)
                 
     elif isinstance(m, nn.Linear):
-        # Glorot uniform for fully connected layers (scaled for float16)
-        nn.init.xavier_uniform_(m.weight.data, gain=0.5)  # Reduced gain for float16
+        # Glorot uniform for fully connected layers (optimized for pure float16)
+        nn.init.xavier_uniform_(m.weight.data, gain=0.3)  # Further reduced for pure float16
         if m.bias is not None:
             m.bias.data.fill_(0.0)
 
 
 def create_dataloader(dataset: LSTMMarketDataset, batch_size: int, 
-                     shuffle: bool, num_workers: int = 0) -> DataLoader:
+                     shuffle: bool, num_workers: int = 0, drop_last: bool = True) -> DataLoader:
     """
-    Create a DataLoader for the dataset
+    Create a DataLoader for the dataset optimized for GPU performance
     
     Args:
         dataset: LSTMMarketDataset instance
         batch_size: Batch size
         shuffle: Whether to shuffle data
         num_workers: Number of worker processes
+        drop_last: Whether to drop the last incomplete batch (False for validation)
     
     Returns:
         DataLoader instance
@@ -202,9 +202,30 @@ def create_dataloader(dataset: LSTMMarketDataset, batch_size: int,
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=True if torch.cuda.is_available() else False,  # Speed up CPU to GPU transfer
-        persistent_workers=True if num_workers > 0 else False  # Keep workers alive between epochs
+        persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
+        prefetch_factor=2 if num_workers > 0 else None,  # Prefetch batches for GPU
+        drop_last=drop_last  # Allow small validation batches
     )
 
+
+def check_tensor_core_support():
+    """Check if the system supports tensor cores"""
+    if not torch.cuda.is_available():
+        return False, "CUDA not available"
+    
+    # Check for tensor core capable GPU
+    device_name = torch.cuda.get_device_name(0)
+    tensor_core_gpus = [
+        'RTX', 'V100', 'A100', 'A40', 'A30', 'A10', 'A16', 'A2',
+        'Titan RTX', 'Quadro RTX', 'Tesla T4'
+    ]
+    
+    has_tensor_cores = any(gpu in device_name for gpu in tensor_core_gpus)
+    
+    if has_tensor_cores:
+        return True, f"Tensor cores supported on {device_name}"
+    else:
+        return False, f"No tensor cores detected on {device_name}"
 
 def train_lstm_model(
     model: LSTMClassifier,
@@ -240,9 +261,8 @@ def train_lstm_model(
     validation_patience = hyperparams.get('validation_patience', 5)  # MATLAB default: 5
     validation_frequency = hyperparams.get('validation_frequency', 7)  # MATLAB default: 7
     
-    # Keep model in float32 for numerical stability, use float16 data
-    # This prevents LSTM primitive descriptor issues while maintaining memory efficiency
-    # model = model.half()  # Commented out to avoid LSTM float16 issues
+    # Convert model to pure float16 for maximum memory efficiency
+    model = model.half()
     
     # Move model to device
     model = model.to(device)
@@ -250,21 +270,34 @@ def train_lstm_model(
     # Use DataParallel for multi-GPU training if available
     if device == 'cuda' and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
+        print(f"Using DataParallel with {torch.cuda.device_count()} GPUs")
+        for i in range(torch.cuda.device_count()):
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+        
+        # Set device to use all available GPUs
+        device_ids = list(range(torch.cuda.device_count()))
+        print(f"Available GPU IDs: {device_ids}")
+    elif device == 'cuda':
+        print(f"Using single GPU: {torch.cuda.get_device_name(0)}")
+        device_ids = [0]
     
     # Loss function: Cross-entropy with numerical stability for float16
     criterion = nn.CrossEntropyLoss()
     
-    # Gradient scaling for float16 training (prevents underflow)
-    scaler = torch.amp.GradScaler('cuda') if device == 'cuda' else None
+    # Check tensor core support
+    tensor_core_available, tensor_core_msg = check_tensor_core_support()
     
-    # Optimizer: ADAM to match MATLAB's trainNetwork with Adam optimizer
-    # MATLAB: SquaredGradientDecayFactor = 0.999 (corresponds to beta2 in PyTorch)
-    # Adjusted for float16 stability
+    # Note: Gradient scaling is not compatible with pure float16 models
+    # We use mixed precision autocast for tensor cores without gradient scaling
+    scaler = None  # Disabled for pure float16 models
+    
+    # Optimizer: ADAM optimized for GPU tensor cores
+    # Adjusted parameters for RTX 4060 Ti performance
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=initial_lr,
         betas=(0.9, 0.999),  # beta1=0.9 (default), beta2=0.999 (MATLAB SquaredGradientDecayFactor)
-        eps=1e-4,  # Increased epsilon for float16 stability
+        eps=1e-4,  # Optimized for tensor cores
         weight_decay=l2_regularization,  # L2 regularization
         amsgrad=False  # Standard Adam for MATLAB compatibility
     )
@@ -277,7 +310,7 @@ def train_lstm_model(
         gamma=lr_drop_factor
     )
     
-    # Training loop
+    # Training loop with performance monitoring
     # Track both validation loss AND accuracy for better model selection
     # MATLAB: OutputNetwork = 'best-validation-loss'
     # We also track accuracy to ensure we're not just minimizing loss without improving predictions
@@ -286,6 +319,19 @@ def train_lstm_model(
     best_model_state = None
     patience_counter = 0
     epochs_since_improvement = 0
+    
+    # Performance monitoring
+    import time
+    start_time = time.time()
+    
+    # Print GPU information
+    if device == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+        if torch.cuda.device_count() > 1:
+            print(f"Multi-GPU: {torch.cuda.device_count()} GPUs detected")
+        else:
+            print("Single GPU mode")
     
     for epoch in range(max_epochs):
         # Training phase
@@ -301,27 +347,41 @@ def train_lstm_model(
             # Forward pass with automatic mixed precision
             optimizer.zero_grad()
             
-            # Simplified approach: no autocast, direct forward pass
-            logits = model(sequences)  # (batch, seq_len, num_classes)
-            
-            # Reshape for loss calculation
-            batch_size, seq_len, num_classes = logits.shape
-            logits_flat = logits.reshape(-1, num_classes)  # (batch * seq_len, num_classes)
-            labels_flat = labels.reshape(-1)  # (batch * seq_len,)
-            
-            # Calculate loss
-            loss = criterion(logits_flat, labels_flat)
+            # High-performance training with tensor core optimization
+            if device == 'cuda' and tensor_core_available:
+                # Use automatic mixed precision for tensor cores (no gradient scaling)
+                with torch.amp.autocast('cuda'):
+                    logits = model(sequences)  # (batch, seq_len, num_classes)
+                    
+                    # Reshape for loss calculation
+                    batch_size, seq_len, num_classes = logits.shape
+                    logits_flat = logits.reshape(-1, num_classes)  # (batch * seq_len, num_classes)
+                    labels_flat = labels.reshape(-1)  # (batch * seq_len,)
+                    
+                    # Calculate loss
+                    loss = criterion(logits_flat, labels_flat)
+            else:
+                # CPU or non-tensor-core GPU training
+                logits = model(sequences)  # (batch, seq_len, num_classes)
+                
+                # Reshape for loss calculation
+                batch_size, seq_len, num_classes = logits.shape
+                logits_flat = logits.reshape(-1, num_classes)  # (batch * seq_len, num_classes)
+                labels_flat = labels.reshape(-1)  # (batch * seq_len,)
+                
+                # Calculate loss
+                loss = criterion(logits_flat, labels_flat)
             
             # Check for NaN loss and handle it
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"Warning: NaN/Inf loss detected, skipping this batch")
                 continue
             
-            # Backward pass
+            # Backward pass (no gradient scaling for pure float16)
             loss.backward()
             
-            # Gradient clipping for stability (matches MATLAB's GradientThreshold behavior)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Reduced for float16
+            # Gradient clipping for stability (reduced for float16)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             
             optimizer.step()
             
@@ -331,6 +391,10 @@ def train_lstm_model(
             train_total += labels_flat.size(0)
             train_correct += (predicted == labels_flat).sum().item()
         
+        # Calculate training metrics
+        avg_train_loss = train_loss / len(train_loader) if len(train_loader) > 0 else 0.0
+        train_acc = 100.0 * train_correct / train_total if train_total > 0 else 0.0
+                
         # Learning rate decay (MATLAB: LearnRateSchedule = 'piecewise')
         scheduler.step()
         
@@ -348,8 +412,12 @@ def train_lstm_model(
                     sequences = sequences.to(device)
                     labels = labels.to(device)
                     
-                    # Simplified validation: no autocast
-                    logits = model(sequences)
+                    # High-performance mixed precision validation
+                    if device == 'cuda' and tensor_core_available:
+                        with torch.amp.autocast('cuda'):
+                            logits = model(sequences)
+                    else:
+                        logits = model(sequences)
                     
                     # Reshape for loss and accuracy calculation
                     batch_size, seq_len, num_classes = logits.shape
@@ -421,8 +489,12 @@ def train_lstm_model(
             sequences = sequences.to(device)
             labels = labels.to(device)
             
-            # Simplified final validation: no autocast
-            logits = model(sequences)
+            # High-performance mixed precision final validation
+            if device == 'cuda' and tensor_core_available:
+                with torch.amp.autocast('cuda'):
+                    logits = model(sequences)
+            else:
+                logits = model(sequences)
             
             batch_size, seq_len, num_classes = logits.shape
             logits_flat = logits.reshape(-1, num_classes)
@@ -434,6 +506,9 @@ def train_lstm_model(
     
     final_val_acc = 100.0 * val_correct / val_total if val_total > 0 else 0.0
     
+    # Calculate total training time
+    total_time = time.time() - start_time
+    
     # Return unwrapped model if using DataParallel
     if isinstance(model, nn.DataParallel):
         model = model.module
@@ -441,9 +516,13 @@ def train_lstm_model(
     info = {
         'final_val_acc': final_val_acc,
         'best_val_loss': best_val_loss,
-        'epochs_trained': epoch + 1
+        'epochs_trained': epoch + 1,
+        'tensor_core_used': tensor_core_available,
+        'device_used': device,
+        'total_training_time': total_time,
+        'avg_epoch_time': total_time / (epoch + 1)
     }
-    
+        
     return model, info
 
 
@@ -481,11 +560,19 @@ def classify_sequences(
     
     with torch.no_grad():
         for seq in sequences:
-            # Convert to tensor and add batch dimension (float16->float32 for model)
-            seq_tensor = torch.from_numpy(seq).half().float().unsqueeze(0).to(device)
+            # Convert to tensor and add batch dimension (pure float16)
+            seq_tensor = torch.from_numpy(seq).half().unsqueeze(0).to(device)
             
-            # Simplified forward pass: no autocast
-            logits = model(seq_tensor)  # (1, seq_len, num_classes)
+            # High-performance mixed precision forward pass
+            if device == 'cuda':
+                tensor_core_available, _ = check_tensor_core_support()
+                if tensor_core_available:
+                    with torch.amp.autocast('cuda'):
+                        logits = model(seq_tensor)  # (1, seq_len, num_classes)
+                else:
+                    logits = model(seq_tensor)  # (1, seq_len, num_classes)
+            else:
+                logits = model(seq_tensor)  # (1, seq_len, num_classes)
             
             # Get predictions for last time step (matches MATLAB behavior)
             last_logits = logits[0, -1, :]  # (num_classes,)
